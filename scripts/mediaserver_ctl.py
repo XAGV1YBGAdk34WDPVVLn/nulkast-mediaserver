@@ -48,7 +48,7 @@ def http_json(url: str, method: str = "GET", payload: dict | None = None) -> dic
 
 
 def cmd_test(_args) -> int:
-    return run(["cargo", "test"], cwd=ROOT)
+    return run([sys.executable, str(ROOT / "scripts" / "test_harness.py")], cwd=ROOT)
 
 
 def cmd_deploy(_args) -> int:

@@ -1,13 +1,16 @@
 use crate::db::MediaItem;
 use crate::diagnostics::Diagnostics;
 use anyhow::{anyhow, Result};
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::process::Command;
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, Semaphore};
 use tracing::{info, warn};
+
+const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(3600);
 
 #[derive(Clone)]
 pub struct ArtworkManager {
@@ -16,6 +19,7 @@ pub struct ArtworkManager {
     pub online_enabled: bool,
     pub diag: Diagnostics,
     sem: Arc<Semaphore>,
+    misses: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 impl ArtworkManager {
@@ -27,6 +31,7 @@ impl ArtworkManager {
             online_enabled,
             diag,
             sem: Arc::new(Semaphore::new(4)),
+            misses: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -149,7 +154,7 @@ impl ArtworkManager {
         is_tv: bool,
         local_media_path: Option<&Path>,
     ) -> Result<Vec<u8>> {
-        if cache_path.exists() {
+        if tokio::fs::try_exists(cache_path).await.unwrap_or(false) {
             return Ok(tokio::fs::read(cache_path).await?);
         }
 
@@ -157,7 +162,10 @@ impl ArtworkManager {
         if let Some(mp) = local_media_path {
             if let Some(local) = Self::find_local_poster(mp) {
                 if let Ok(bytes) = tokio::fs::read(&local).await {
-                    let _ = tokio::fs::write(cache_path, &bytes).await;
+                    let tmp = cache_path.with_extension("tmp.jpg");
+                    if tokio::fs::write(&tmp, &bytes).await.is_ok() {
+                        let _ = tokio::fs::rename(&tmp, cache_path).await;
+                    }
                     return Ok(bytes);
                 }
             }
@@ -167,8 +175,19 @@ impl ArtworkManager {
             return Err(anyhow!("Online artwork disabled and no local poster found"));
         }
 
+        // Check negative cache (1h TTL) so missing titles don't re-spawn curl on every page load
+        let miss_key = format!("{}:{}:{:?}", if is_tv { "tv" } else { "m" }, title.to_ascii_lowercase(), year);
+        {
+            let m = self.misses.lock().await;
+            if let Some(ts) = m.get(&miss_key) {
+                if ts.elapsed() < NEGATIVE_CACHE_TTL {
+                    return Err(anyhow!("Cached poster miss for '{}'", title));
+                }
+            }
+        }
+
         let _permit = self.sem.acquire().await?;
-        if cache_path.exists() {
+        if tokio::fs::try_exists(cache_path).await.unwrap_or(false) {
             return Ok(tokio::fs::read(cache_path).await?);
         }
 
@@ -186,6 +205,7 @@ impl ArtworkManager {
         }
 
         let Some(url) = poster_url else {
+            self.misses.lock().await.insert(miss_key, Instant::now());
             self.diag.record("warn", "artwork", format!("No official poster found for '{}'", title));
             return Err(anyhow!("No official poster found for '{}'", title));
         };

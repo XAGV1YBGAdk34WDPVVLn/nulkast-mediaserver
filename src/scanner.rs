@@ -311,6 +311,7 @@ pub fn scan_library(db: &Db, media_root: &Path) -> Result<ScanReport> {
         return Ok(report);
     }
 
+    let existing_stamps = db.get_all_file_stamps().unwrap_or_default();
     let mut seen_paths = HashSet::new();
 
     for entry in WalkDir::new(media_root)
@@ -343,7 +344,7 @@ pub fn scan_library(db: &Db, media_root: &Path) -> Result<ScanReport> {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
 
-        if let Ok(Some((_id, old_size, old_mtime))) = db.get_file_stamp(&path_str) {
+        if let Some(&(old_size, old_mtime)) = existing_stamps.get(&path_str) {
             if old_size == file_size && old_mtime == mtime {
                 report.skipped += 1;
                 continue;

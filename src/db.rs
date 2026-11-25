@@ -75,6 +75,8 @@ impl Db {
             PRAGMA synchronous = NORMAL;
             PRAGMA foreign_keys = ON;
             PRAGMA busy_timeout = 5000;
+            PRAGMA temp_store = MEMORY;
+            PRAGMA cache_size = -16000;
 
             CREATE TABLE IF NOT EXISTS media_items (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -107,7 +109,9 @@ impl Db {
             );
 
             CREATE INDEX IF NOT EXISTS idx_media_kind ON media_items(kind);
+            CREATE INDEX IF NOT EXISTS idx_media_kind_mtime ON media_items(kind, mtime DESC);
             CREATE INDEX IF NOT EXISTS idx_media_show ON media_items(show_name, season, episode);
+            CREATE INDEX IF NOT EXISTS idx_progress_watched_played ON watch_progress(watched, last_played DESC);
 
             CREATE VIRTUAL TABLE IF NOT EXISTS media_fts USING fts5(
                 title,
@@ -136,16 +140,21 @@ impl Db {
         })
     }
 
-    pub fn get_file_stamp(&self, path: &str) -> Result<Option<(i64, i64, i64)>> {
-        let conn = self.conn.lock().unwrap();
-        let row = conn
-            .query_row(
-                "SELECT id, file_size, mtime FROM media_items WHERE path = ?1",
-                params![path],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .optional()?;
-        Ok(row)
+    fn lock_conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn get_all_file_stamps(&self) -> Result<std::collections::HashMap<String, (i64, i64)>> {
+        let conn = self.lock_conn();
+        let mut stmt = conn.prepare("SELECT path, file_size, mtime FROM media_items")?;
+        let mut map = std::collections::HashMap::new();
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+        })?;
+        for r in rows.flatten() {
+            map.insert(r.0, (r.1, r.2));
+        }
+        Ok(map)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -168,8 +177,8 @@ impl Db {
         container: &str,
         subtitles_json: &str,
     ) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let conn = self.lock_conn();
+        let id: i64 = conn.query_row(
             "INSERT INTO media_items (
                 path, kind, title, year, show_name, season, episode,
                 file_size, mtime, duration_secs, width, height,
@@ -190,7 +199,8 @@ impl Db {
                 video_codec=excluded.video_codec,
                 audio_codec=excluded.audio_codec,
                 container=excluded.container,
-                subtitles_json=excluded.subtitles_json",
+                subtitles_json=excluded.subtitles_json
+            RETURNING id",
             params![
                 path,
                 kind,
@@ -209,28 +219,29 @@ impl Db {
                 container,
                 subtitles_json,
             ],
-        )?;
-        let id: i64 = conn.query_row(
-            "SELECT id FROM media_items WHERE path = ?1",
-            params![path],
             |r| r.get(0),
         )?;
         Ok(id)
     }
 
     pub fn prune_missing_paths(&self, existing_paths: &std::collections::HashSet<String>) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT id, path FROM media_items")?;
-        let rows: Vec<(i64, String)> = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        let rows: Vec<(i64, String)> = {
+            let mut stmt = tx.prepare("SELECT id, path FROM media_items")?;
+            let mapped = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            mapped
+        };
         let mut removed = 0usize;
         for (id, path) in rows {
             if !existing_paths.contains(&path) {
-                conn.execute("DELETE FROM media_items WHERE id = ?1", params![id])?;
+                tx.execute("DELETE FROM media_items WHERE id = ?1", params![id])?;
                 removed += 1;
             }
         }
+        tx.commit()?;
         Ok(removed)
     }
 

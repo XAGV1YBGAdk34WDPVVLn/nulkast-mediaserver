@@ -13,13 +13,17 @@ use tokio::sync::{Mutex, Semaphore};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+const MAX_CONCURRENT_SESSIONS: usize = 4;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct StartStreamRequest {
     #[serde(default)]
     pub start_secs: f64,
-    /// "auto" | "remux" | "1080p" | "720p" | "480p"
+    /// "auto" | "remux" | "1080p" | "720p" | "480p" | "cpu"
     #[serde(default = "default_quality")]
     pub quality: String,
+    #[serde(default)]
+    pub previous_session_id: Option<String>,
 }
 
 fn default_quality() -> String {
@@ -63,6 +67,7 @@ pub struct TranscodeManager {
     pub diag: Diagnostics,
     sessions: Arc<Mutex<HashMap<String, ActiveSession>>>,
     thumb_sem: Arc<Semaphore>,
+    sub_sem: Arc<Semaphore>,
 }
 
 impl TranscodeManager {
@@ -92,6 +97,21 @@ impl TranscodeManager {
             warn!("No /dev/dri/renderD* device found (or hw_accel=false); video transcoding will use CPU fallback");
         }
 
+        // Clean up any orphaned HLS directories from prior runs/crashes in /dev/shm
+        if scratch_root.exists() {
+            if let Ok(rd) = std::fs::read_dir(&scratch_root) {
+                let mut cleaned = 0usize;
+                for entry in rd.flatten() {
+                    let p = entry.path();
+                    if p.is_dir() && std::fs::remove_dir_all(&p).is_ok() {
+                        cleaned += 1;
+                    }
+                }
+                if cleaned > 0 {
+                    info!("Purged {} orphaned HLS session dirs from {:?}", cleaned, scratch_root);
+                }
+            }
+        }
         let _ = std::fs::create_dir_all(&scratch_root);
 
         Self {
@@ -101,6 +121,7 @@ impl TranscodeManager {
             diag,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             thumb_sem: Arc::new(Semaphore::new(2)),
+            sub_sem: Arc::new(Semaphore::new(2)),
         }
     }
 
@@ -112,7 +133,7 @@ impl TranscodeManager {
     }
 
     pub fn can_remux_video(item: &MediaItem, quality: &str) -> bool {
-        if matches!(quality, "720p" | "480p") {
+        if matches!(quality, "720p" | "480p" | "cpu") {
             return false;
         }
         if quality == "1080p" && item.height > 1080 {
@@ -121,11 +142,35 @@ impl TranscodeManager {
         matches!(item.video_codec.as_str(), "h264" | "avc1")
     }
 
+    pub fn vaapi_decode_supported(codec: &str) -> bool {
+        matches!(codec, "h264" | "avc1" | "hevc" | "h265" | "vp9" | "av1" | "mpeg2video")
+    }
+
+    fn target_height(item: &MediaItem, quality: &str) -> Option<i64> {
+        let desired = match quality {
+            "480p" => Some(480),
+            "720p" => Some(720),
+            "1080p" => Some(1080),
+            _ => None,
+        }?;
+        // Never upscale smaller videos
+        if item.height > 0 && item.height <= desired {
+            None
+        } else {
+            Some(desired)
+        }
+    }
+
     pub async fn start_stream(
         &self,
         item: &MediaItem,
         req: &StartStreamRequest,
     ) -> Result<StartStreamResponse> {
+        // Immediately clean up prior session if the client switched videos or seeked
+        if let Some(ref prev_id) = req.previous_session_id {
+            self.stop_session(prev_id).await;
+        }
+
         // Direct Play fast path: zero FFmpeg overhead
         if req.quality == "auto" && Self::can_direct_play(item) {
             self.diag.record(
@@ -142,76 +187,134 @@ impl TranscodeManager {
             });
         }
 
+        // Enforce concurrent session cap (evict oldest idle session if at limit)
+        self.evict_if_full().await;
+
+        let try_remux = Self::can_remux_video(item, &req.quality);
+        let try_vaapi = !try_remux
+            && req.quality != "cpu"
+            && self.vaapi_device.is_some()
+            && Self::vaapi_decode_supported(&item.video_codec);
+
+        let initial_mode = if try_remux {
+            "remux"
+        } else if try_vaapi {
+            "vaapi"
+        } else {
+            "software"
+        };
+
+        match self.spawn_hls_session(item, req, initial_mode).await {
+            Ok(resp) => Ok(resp),
+            Err(e) if initial_mode == "vaapi" => {
+                warn!("VA-API failed for media {} ({}); falling back to CPU libx264", item.id, e);
+                self.diag.record(
+                    "warn",
+                    "transcode",
+                    format!("VA-API fallback -> CPU for '{}' ({})", item.title, e),
+                );
+                self.spawn_hls_session(item, req, "software").await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn spawn_hls_session(
+        &self,
+        item: &MediaItem,
+        req: &StartStreamRequest,
+        mode: &str,
+    ) -> Result<StartStreamResponse> {
         let session_id = Uuid::new_v4().to_string();
         let dir = self.scratch_root.join(&session_id);
-        std::fs::create_dir_all(&dir)?;
+        tokio::fs::create_dir_all(&dir).await?;
 
         let playlist_path = dir.join("index.m3u8");
         let seg_pattern = dir.join("seg_%05d.ts");
+        let seg_secs = self.hls_segment_secs;
+        let kf_expr = format!("expr:gte(t,n_forced*{})", seg_secs);
 
         let mut cmd = Command::new("ffmpeg");
-        cmd.stdin(Stdio::null())
+        cmd.kill_on_drop(true)
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
-            .args(["-v", "warning"]);
+            .args(["-v", "warning", "-nostdin"]);
 
-        let (mode, hw_accel) = if Self::can_remux_video(item, &req.quality) {
-            if req.start_secs > 1.0 {
-                cmd.args(["-ss", &format!("{:.2}", req.start_secs)]);
-            }
-            cmd.args(["-i", &item.path])
-                .args(["-map", "0:v:0", "-map", "0:a:0?"])
-                .args(["-c:v", "copy"])
-                .args(["-c:a", "aac", "-ac", "2", "-b:a", "192k"]);
-            ("remux".to_string(), false)
-        } else if let Some(ref dev) = self.vaapi_device {
-            // scale_vaapi=format=nv12 converts 10-bit HEVC (p010) to 8-bit nv12 in GPU VRAM
-            // so h264_vaapi works on both 8-bit and 10-bit sources with zero CPU copy.
-            cmd.args(["-hwaccel", "vaapi"])
-                .args(["-vaapi_device", &dev.to_string_lossy()])
-                .args(["-hwaccel_output_format", "vaapi"]);
-            if req.start_secs > 1.0 {
-                cmd.args(["-ss", &format!("{:.2}", req.start_secs)]);
-            }
-            cmd.args(["-i", &item.path])
-                .args(["-map", "0:v:0", "-map", "0:a:0?"]);
-
-            let scale_filter = match req.quality.as_str() {
-                "480p" => "scale_vaapi=w=-2:h=480:format=nv12",
-                "720p" => "scale_vaapi=w=-2:h=720:format=nv12",
-                "1080p" => "scale_vaapi=w=-2:h=1080:format=nv12",
-                _ => "scale_vaapi=format=nv12",
-            };
-            let bitrate = match req.quality.as_str() {
-                "480p" => "2500k",
-                "720p" => "5000k",
-                _ => "12000k",
-            };
-
-            cmd.args(["-vf", scale_filter])
-                .args(["-c:v", "h264_vaapi", "-b:v", bitrate, "-maxrate", bitrate, "-bufsize", "24000k"])
-                .args(["-c:a", "aac", "-ac", "2", "-b:a", "192k"]);
-            ("vaapi".to_string(), true)
-        } else {
-            if req.start_secs > 1.0 {
-                cmd.args(["-ss", &format!("{:.2}", req.start_secs)]);
-            }
-            cmd.args(["-i", &item.path])
-                .args(["-map", "0:v:0", "-map", "0:a:0?"]);
-            match req.quality.as_str() {
-                "480p" => { cmd.args(["-vf", "scale=-2:480"]); }
-                "720p" => { cmd.args(["-vf", "scale=-2:720"]); }
-                _ => {}
-            }
-            cmd.args(["-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p"])
-                .args(["-c:a", "aac", "-ac", "2", "-b:a", "192k"]);
-            ("software".to_string(), false)
+        let scale_h = Self::target_height(item, &req.quality);
+        let (bitrate, bufsize) = match req.quality.as_str() {
+            "480p" => ("2500k", "5000k"),
+            "720p" => ("5000k", "10000k"),
+            _ => ("10000k", "20000k"),
         };
 
-        let hls_time = self.hls_segment_secs.to_string();
+        let hw_accel = mode == "vaapi";
+
+        match mode {
+            "remux" => {
+                if req.start_secs > 0.0 {
+                    cmd.args(["-ss", &format!("{:.2}", req.start_secs)]);
+                }
+                cmd.args(["-fflags", "+genpts", "-i", &item.path])
+                    .args(["-map", "0:v:0", "-map", "0:a:0?"])
+                    .args(["-c:v", "copy"])
+                    .args(["-avoid_negative_ts", "make_zero"])
+                    .args(["-af", "aresample=async=1:first_pts=0"])
+                    .args(["-c:a", "aac", "-ac", "2", "-b:a", "192k"]);
+            }
+            "vaapi" => {
+                let dev = self
+                    .vaapi_device
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("No VA-API device"))?;
+                // Pace transcode at 2.5x realtime after an initial 24s fast burst so /dev/shm stays bounded
+                cmd.args(["-readrate", "2.5", "-readrate_initial_burst", "24"])
+                    .args(["-hwaccel", "vaapi"])
+                    .args(["-vaapi_device", &dev.to_string_lossy()])
+                    .args(["-hwaccel_output_format", "vaapi"]);
+                if req.start_secs > 0.0 {
+                    cmd.args(["-ss", &format!("{:.2}", req.start_secs)]);
+                }
+                cmd.args(["-i", &item.path])
+                    .args(["-map", "0:v:0", "-map", "0:a:0?"]);
+
+                // scale_vaapi=format=nv12 converts 10-bit HEVC (p010) -> 8-bit nv12 in GPU VRAM
+                let vf = match scale_h {
+                    Some(h) => format!("scale_vaapi=w=-2:h={}:format=nv12", h),
+                    None => "scale_vaapi=format=nv12".to_string(),
+                };
+                cmd.args(["-vf", &vf])
+                    .args(["-force_key_frames", &kf_expr])
+                    .args(["-c:v", "h264_vaapi", "-b:v", bitrate, "-maxrate", bitrate, "-bufsize", bufsize])
+                    .args(["-af", "aresample=async=1:first_pts=0"])
+                    .args(["-c:a", "aac", "-ac", "2", "-b:a", "192k"]);
+            }
+            _ => {
+                cmd.args(["-readrate", "2.5", "-readrate_initial_burst", "24"]);
+                if req.start_secs > 0.0 {
+                    cmd.args(["-ss", &format!("{:.2}", req.start_secs)]);
+                }
+                cmd.args(["-i", &item.path])
+                    .args(["-map", "0:v:0", "-map", "0:a:0?"]);
+                if let Some(h) = scale_h {
+                    cmd.args(["-vf", &format!("scale=-2:{}", h)]);
+                }
+                cmd.args(["-force_key_frames", &kf_expr, "-sc_threshold", "0"])
+                    .args([
+                        "-c:v", "libx264", "-preset", "veryfast", "-profile:v", "high", "-level", "4.1",
+                        "-crf", "22", "-maxrate", bitrate, "-bufsize", bufsize, "-pix_fmt", "yuv420p",
+                    ])
+                    .args(["-af", "aresample=async=1:first_pts=0"])
+                    .args(["-c:a", "aac", "-ac", "2", "-b:a", "192k"]);
+            }
+        }
+
+        let hls_time = seg_secs.to_string();
         cmd.args([
             "-f",
             "hls",
+            "-hls_playlist_type",
+            "event",
             "-hls_time",
             &hls_time,
             "-hls_list_size",
@@ -266,7 +369,7 @@ impl TranscodeManager {
                     id: session_id.clone(),
                     media_id: item.id,
                     dir: dir.clone(),
-                    mode: mode.clone(),
+                    mode: mode.to_string(),
                     child: Some(child),
                     last_access: Instant::now(),
                     stderr_tail: stderr_tail.clone(),
@@ -277,11 +380,11 @@ impl TranscodeManager {
         // Wait up to 10s for index.m3u8 and first .ts segment, aborting early if ffmpeg exits with error
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
-            if playlist_path.exists() {
-                if let Ok(content) = std::fs::read_to_string(&playlist_path) {
+            if tokio::fs::try_exists(&playlist_path).await.unwrap_or(false) {
+                if let Ok(content) = tokio::fs::read_to_string(&playlist_path).await {
                     if content.contains(".ts") {
                         return Ok(StartStreamResponse {
-                            mode,
+                            mode: mode.to_string(),
                             session_id: Some(session_id.clone()),
                             stream_url: format!("/api/hls/{}/index.m3u8", session_id),
                             hw_accel,
@@ -290,7 +393,6 @@ impl TranscodeManager {
                     }
                 }
             }
-            // Check if ffmpeg died prematurely
             let exited_err = {
                 let mut map = self.sessions.lock().await;
                 if let Some(sess) = map.get_mut(&session_id) {
@@ -307,17 +409,18 @@ impl TranscodeManager {
                 }
             };
             if let Some(status) = exited_err {
+                tokio::time::sleep(Duration::from_millis(50)).await;
                 let err_lines = stderr_tail.lock().await.join(" | ");
-                error!("FFmpeg exited early ({}): {}", status, err_lines);
-                self.diag.record("error", "ffmpeg", format!("FFmpeg failed ({}): {}", status, err_lines));
+                error!("FFmpeg ({}) exited early ({}): {}", mode, status, err_lines);
+                self.diag.record("error", "ffmpeg", format!("FFmpeg {} failed ({}): {}", mode, status, err_lines));
                 self.stop_session(&session_id).await;
-                return Err(anyhow!("FFmpeg failed ({}): {}", status, err_lines));
+                return Err(anyhow!("FFmpeg {} failed ({}): {}", mode, status, err_lines));
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(80)).await;
         }
 
         Ok(StartStreamResponse {
-            mode,
+            mode: mode.to_string(),
             session_id: Some(session_id.clone()),
             stream_url: format!("/api/hls/{}/index.m3u8", session_id),
             hw_accel,
@@ -325,15 +428,31 @@ impl TranscodeManager {
         })
     }
 
+    async fn evict_if_full(&self) {
+        let oldest_id = {
+            let map = self.sessions.lock().await;
+            if map.len() < MAX_CONCURRENT_SESSIONS {
+                return;
+            }
+            map.values()
+                .min_by_key(|s| s.last_access)
+                .map(|s| s.id.clone())
+        };
+        if let Some(id) = oldest_id {
+            warn!("Evicting LRU transcode session {} (max {} reached)", id, MAX_CONCURRENT_SESSIONS);
+            self.stop_session(&id).await;
+        }
+    }
+
     pub async fn generate_thumb(&self, item: &MediaItem, thumb_path: &Path) -> Result<()> {
-        if thumb_path.exists() {
+        if tokio::fs::try_exists(thumb_path).await.unwrap_or(false) {
             return Ok(());
         }
         if let Some(parent) = thumb_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            let _ = tokio::fs::create_dir_all(parent).await;
         }
         let _permit = self.thumb_sem.acquire().await?;
-        if thumb_path.exists() {
+        if tokio::fs::try_exists(thumb_path).await.unwrap_or(false) {
             return Ok(());
         }
         let seek_secs = if item.duration_secs > 180.0 {
@@ -344,56 +463,117 @@ impl TranscodeManager {
             2.0
         };
         let tmp_path = thumb_path.with_extension("tmp.jpg");
-        let status = Command::new("ffmpeg")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .args(["-v", "error", "-ss", &format!("{:.1}", seek_secs), "-i", &item.path])
-            .args(["-frames:v", "1", "-vf", "scale=480:-1", "-q:v", "5", "-y"])
-            .arg(&tmp_path)
-            .status()
-            .await?;
+        let status = tokio::time::timeout(
+            Duration::from_secs(15),
+            Command::new("ffmpeg")
+                .kill_on_drop(true)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .args(["-v", "error", "-nostdin", "-ss", &format!("{:.1}", seek_secs), "-i", &item.path])
+                .args(["-frames:v", "1", "-vf", "scale=480:-1", "-q:v", "5", "-y"])
+                .arg(&tmp_path)
+                .status(),
+        )
+        .await??;
 
-        if status.success() && tmp_path.exists() {
-            let _ = std::fs::rename(&tmp_path, thumb_path);
+        if status.success() && tokio::fs::try_exists(&tmp_path).await.unwrap_or(false) {
+            let _ = tokio::fs::rename(&tmp_path, thumb_path).await;
             Ok(())
         } else {
-            let _ = std::fs::remove_file(&tmp_path);
+            let _ = tokio::fs::remove_file(&tmp_path).await;
             Err(anyhow!("Thumbnail generation failed for media {}", item.id))
         }
     }
 
-    pub async fn touch_and_resolve(&self, session_id: &str, filename: &str) -> Option<PathBuf> {
+    pub async fn extract_subtitle_cached(
+        &self,
+        media_id: i64,
+        media_path: &Path,
+        stream_index: i64,
+        cache_dir: &Path,
+    ) -> Result<String> {
+        let cache_path = cache_dir.join(format!("{}_{}.vtt", media_id, stream_index));
+        if let Ok(vtt) = tokio::fs::read_to_string(&cache_path).await {
+            return Ok(vtt);
+        }
+        let _ = tokio::fs::create_dir_all(cache_dir).await;
+        let _permit = self.sub_sem.acquire().await?;
+        if let Ok(vtt) = tokio::fs::read_to_string(&cache_path).await {
+            return Ok(vtt);
+        }
+
+        let output = tokio::time::timeout(
+            Duration::from_secs(25),
+            Command::new("ffmpeg")
+                .kill_on_drop(true)
+                .args(["-v", "quiet", "-nostdin", "-i"])
+                .arg(media_path)
+                .args(["-map", &format!("0:{}", stream_index), "-f", "webvtt", "pipe:1"])
+                .output(),
+        )
+        .await??;
+
+        if !output.status.success() {
+            return Err(anyhow!("ffmpeg subtitle extraction failed"));
+        }
+        let vtt = String::from_utf8_lossy(&output.stdout).to_string();
+        let tmp = cache_path.with_extension("tmp.vtt");
+        if tokio::fs::write(&tmp, &vtt).await.is_ok() {
+            let _ = tokio::fs::rename(&tmp, &cache_path).await;
+        }
+        Ok(vtt)
+    }
+
+    /// Resolves a session file and reports whether the underlying ffmpeg process is still running.
+    pub async fn touch_and_resolve(&self, session_id: &str, filename: &str) -> Option<(PathBuf, bool)> {
         if filename.contains("..") || filename.contains('/') || filename.contains('\\') {
             return None;
         }
         let mut map = self.sessions.lock().await;
         let sess = map.get_mut(session_id)?;
         sess.last_access = Instant::now();
-        Some(sess.dir.join(filename))
+        let running = match sess.child.as_mut() {
+            Some(ch) => matches!(ch.try_wait(), Ok(None)),
+            None => false,
+        };
+        Some((sess.dir.join(filename), running))
     }
 
     pub async fn stop_session(&self, session_id: &str) {
-        let mut map = self.sessions.lock().await;
-        if let Some(mut sess) = map.remove(session_id) {
+        // Release the sessions mutex BEFORE awaiting child.kill() and filesystem removal
+        let removed = {
+            let mut map = self.sessions.lock().await;
+            map.remove(session_id)
+        };
+        if let Some(mut sess) = removed {
             if let Some(ref mut child) = sess.child {
                 let _ = child.kill().await;
+                let _ = child.wait().await;
             }
-            let _ = std::fs::remove_dir_all(&sess.dir);
+            let _ = tokio::fs::remove_dir_all(&sess.dir).await;
             info!("Stopped and cleaned HLS session {}", session_id);
         }
     }
 
-    pub async fn reap_idle_sessions(&self, max_idle: Duration) {
-        let mut to_remove = Vec::new();
-        {
+    pub async fn stop_all_sessions(&self) {
+        let ids: Vec<String> = {
             let map = self.sessions.lock().await;
-            for (id, sess) in map.iter() {
-                if sess.last_access.elapsed() > max_idle {
-                    to_remove.push(id.clone());
-                }
-            }
+            map.keys().cloned().collect()
+        };
+        for id in ids {
+            self.stop_session(&id).await;
         }
+    }
+
+    pub async fn reap_idle_sessions(&self, max_idle: Duration) {
+        let to_remove: Vec<String> = {
+            let map = self.sessions.lock().await;
+            map.iter()
+                .filter(|(_, sess)| sess.last_access.elapsed() > max_idle)
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
         for id in to_remove {
             self.stop_session(&id).await;
         }
@@ -404,23 +584,38 @@ impl TranscodeManager {
     }
 
     pub async fn session_snapshots(&self) -> Vec<SessionSnapshot> {
-        let map = self.sessions.lock().await;
-        let mut out = Vec::with_capacity(map.len());
-        for s in map.values() {
-            let segs = std::fs::read_dir(&s.dir)
-                .ok()
-                .map(|rd| {
-                    rd.filter_map(|e| e.ok())
-                        .filter(|e| e.file_name().to_string_lossy().ends_with(".ts"))
-                        .count()
+        let entries: Vec<(String, i64, String, PathBuf, u64, Arc<Mutex<Vec<String>>>)> = {
+            let map = self.sessions.lock().await;
+            map.values()
+                .map(|s| {
+                    (
+                        s.id.clone(),
+                        s.media_id,
+                        s.mode.clone(),
+                        s.dir.clone(),
+                        s.last_access.elapsed().as_secs(),
+                        s.stderr_tail.clone(),
+                    )
                 })
-                .unwrap_or(0);
-            let last_stderr = s.stderr_tail.lock().await.clone();
+                .collect()
+        };
+
+        let mut out = Vec::with_capacity(entries.len());
+        for (id, media_id, mode, dir, idle_secs, stderr_tail) in entries {
+            let mut segs = 0usize;
+            if let Ok(mut rd) = tokio::fs::read_dir(&dir).await {
+                while let Ok(Some(e)) = rd.next_line_or_entry().await {
+                    if e.file_name().to_string_lossy().ends_with(".ts") {
+                        segs += 1;
+                    }
+                }
+            }
+            let last_stderr = stderr_tail.lock().await.clone();
             out.push(SessionSnapshot {
-                id: s.id.clone(),
-                media_id: s.media_id,
-                mode: s.mode.clone(),
-                idle_secs: s.last_access.elapsed().as_secs(),
+                id,
+                media_id,
+                mode,
+                idle_secs,
                 segments_ready: segs,
                 last_stderr,
             });
@@ -429,16 +624,11 @@ impl TranscodeManager {
     }
 }
 
-pub async fn extract_subtitle_vtt(media_path: &Path, stream_index: i64) -> Result<String> {
-    let output = Command::new("ffmpeg")
-        .args(["-v", "quiet", "-i"])
-        .arg(media_path)
-        .args(["-map", &format!("0:{}", stream_index), "-f", "webvtt", "pipe:1"])
-        .output()
-        .await?;
-
-    if !output.status.success() {
-        return Err(anyhow!("ffmpeg subtitle extraction failed"));
+trait ReadDirCompat {
+    async fn next_line_or_entry(&mut self) -> std::io::Result<Option<tokio::fs::DirEntry>>;
+}
+impl ReadDirCompat for tokio::fs::ReadDir {
+    async fn next_line_or_entry(&mut self) -> std::io::Result<Option<tokio::fs::DirEntry>> {
+        self.next_entry().await
     }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }

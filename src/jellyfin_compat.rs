@@ -95,6 +95,7 @@ pub fn spawn_udp_discovery(
                 }
                 Err(e) => {
                     warn!("UDP discovery recv error: {}", e);
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
             }
         }

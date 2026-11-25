@@ -23,6 +23,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs::File;
@@ -31,7 +32,7 @@ use tokio_util::io::ReaderStream;
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 use tracing::{error, info};
-use transcode::{extract_subtitle_vtt, StartStreamRequest, TranscodeManager};
+use transcode::{StartStreamRequest, TranscodeManager};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -45,7 +46,7 @@ pub struct AppState {
     pub server_id: String,
     pub public_url: String,
     pub web_dir: PathBuf,
-    pub scanning: Arc<tokio::sync::Mutex<bool>>,
+    pub scanning: Arc<AtomicBool>,
 }
 
 #[derive(Deserialize)]
@@ -262,22 +263,37 @@ async fn api_update_progress(
 }
 
 async fn api_scan(State(state): State<AppState>) -> impl IntoResponse {
-    let mut guard = state.scanning.lock().await;
-    if *guard {
+    if state
+        .scanning
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
         return (StatusCode::ACCEPTED, Json(json!({ "status": "already_scanning" }))).into_response();
     }
-    *guard = true;
-    drop(guard);
 
     let db = state.db.clone();
     let root = state.media_root.clone();
     let scanning = state.scanning.clone();
+    let artwork = state.artwork.clone();
 
-    let res = tokio::task::spawn_blocking(move || scanner::scan_library(&db, &root)).await;
-    *scanning.lock().await = false;
+    // Detached task guarantees `scanning` flag ALWAYS resets even if HTTP client disconnects
+    let handle = tokio::spawn(async move {
+        let res = tokio::task::spawn_blocking(move || scanner::scan_library(&db, &root)).await;
+        scanning.store(false, Ordering::SeqCst);
+        res
+    });
 
-    match res {
-        Ok(Ok(report)) => (StatusCode::OK, Json(report)).into_response(),
+    match handle.await {
+        Ok(Ok(Ok(report))) => {
+            // Trigger background genre enrichment for any newly added items
+            let enrich_db = state.db.clone();
+            tokio::spawn(async move {
+                artwork.enrich_missing_movie_genres(&enrich_db).await;
+                artwork.enrich_missing_show_genres(&enrich_db).await;
+            });
+            (StatusCode::OK, Json(report)).into_response()
+        }
+        Ok(Ok(Err(e))) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response(),
         Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response(),
     }
@@ -311,7 +327,43 @@ async fn api_stop_session(
     (StatusCode::OK, Json(json!({ "stopped": session_id })))
 }
 
-/// Full HTTP Range (206 Partial Content) direct byte-streaming for instant seek & zero transcoding.
+/// Parses RFC 9110 byte range header: `bytes=start-end`, `bytes=start-`, or `bytes=-suffix`.
+fn parse_byte_range(header_val: &str, file_size: u64) -> Option<Result<(u64, u64), ()>> {
+    let spec = header_val.strip_prefix("bytes=")?;
+    // Use first range if multiple requested
+    let first = spec.split(',').next()?.trim();
+    let (start_s, end_s) = first.split_once('-')?;
+    if file_size == 0 {
+        return Some(Err(()));
+    }
+    if start_s.is_empty() {
+        // Suffix range: bytes=-N (last N bytes, used by browsers for MP4 moov atoms)
+        let suffix: u64 = end_s.parse().ok()?;
+        if suffix == 0 {
+            return Some(Err(()));
+        }
+        let len = suffix.min(file_size);
+        Some(Ok((file_size - len, file_size - 1)))
+    } else {
+        let start: u64 = start_s.parse().ok()?;
+        if start >= file_size {
+            return Some(Err(()));
+        }
+        let end = if end_s.is_empty() {
+            // Generous 16 MB open-ended chunk for smooth high-bitrate playback
+            (start + 16 * 1024 * 1024 - 1).min(file_size - 1)
+        } else {
+            let parsed_end: u64 = end_s.parse().ok()?;
+            if parsed_end < start {
+                return Some(Err(()));
+            }
+            parsed_end.min(file_size - 1)
+        };
+        Some(Ok((start, end)))
+    }
+}
+
+/// Full RFC 9110 HTTP Range (206 Partial Content / 416 Range Not Satisfiable) direct byte-streaming.
 async fn api_direct_stream(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -336,19 +388,12 @@ async fn api_direct_stream(
         .to_string();
 
     if let Some(range_val) = headers.get(header::RANGE).and_then(|v| v.to_str().ok()) {
-        if let Some(spec) = range_val.strip_prefix("bytes=") {
-            let parts: Vec<&str> = spec.split('-').collect();
-            if parts.len() == 2 {
-                let start: u64 = parts[0].parse().unwrap_or(0);
-                let end: u64 = if parts[1].is_empty() {
-                    (start + 4 * 1024 * 1024 - 1).min(file_size.saturating_sub(1))
-                } else {
-                    parts[1].parse().unwrap_or(file_size.saturating_sub(1)).min(file_size.saturating_sub(1))
-                };
-                if start <= end && start < file_size {
+        if let Some(parsed) = parse_byte_range(range_val, file_size) {
+            match parsed {
+                Ok((start, end)) => {
                     let len = end - start + 1;
                     if file.seek(SeekFrom::Start(start)).await.is_ok() {
-                        let stream = ReaderStream::new(file.take(len));
+                        let stream = ReaderStream::with_capacity(file.take(len), 64 * 1024);
                         return (
                             StatusCode::PARTIAL_CONTENT,
                             [
@@ -362,11 +407,18 @@ async fn api_direct_stream(
                             .into_response();
                     }
                 }
+                Err(()) => {
+                    return (
+                        StatusCode::RANGE_NOT_SATISFIABLE,
+                        [(header::CONTENT_RANGE, format!("bytes */{}", file_size))],
+                    )
+                        .into_response();
+                }
             }
         }
     }
 
-    let stream = ReaderStream::new(file);
+    let stream = ReaderStream::with_capacity(file, 64 * 1024);
     (
         StatusCode::OK,
         [
@@ -383,38 +435,56 @@ async fn api_hls_file(
     State(state): State<AppState>,
     Path((session_id, filename)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let Some(file_path) = state.transcoder.touch_and_resolve(&session_id, &filename).await else {
+    let Some((file_path, running)) = state.transcoder.touch_and_resolve(&session_id, &filename).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    // Wait briefly if FFmpeg is actively writing the next segment
-    for _ in 0..25 {
-        if file_path.exists() {
-            break;
+    // Wait briefly only if ffmpeg is actively running and writing the next segment
+    if running {
+        for _ in 0..25 {
+            if tokio::fs::try_exists(&file_path).await.unwrap_or(false) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(60)).await;
         }
-        tokio::time::sleep(Duration::from_millis(80)).await;
     }
 
-    let bytes = match tokio::fs::read(&file_path).await {
-        Ok(b) => b,
+    if filename.ends_with(".m3u8") {
+        let bytes = match tokio::fs::read(&file_path).await {
+            Ok(b) => b,
+            Err(_) => return StatusCode::NOT_FOUND.into_response(),
+        };
+        return (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/vnd.apple.mpegurl"),
+                (header::CACHE_CONTROL, "no-cache, no-store"),
+            ],
+            bytes,
+        )
+            .into_response();
+    }
+
+    // Stream .ts segments directly from /dev/shm with 64 KB chunks (zero heap duplication!)
+    let file = match File::open(&file_path).await {
+        Ok(f) => f,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
-
-    let ctype = if filename.ends_with(".m3u8") {
-        "application/vnd.apple.mpegurl"
-    } else if filename.ends_with(".ts") {
+    let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+    let ctype = if filename.ends_with(".ts") {
         "video/mp2t"
     } else {
         "application/octet-stream"
     };
-
+    let stream = ReaderStream::with_capacity(file, 64 * 1024);
     (
         StatusCode::OK,
         [
-            (header::CONTENT_TYPE, ctype),
-            (header::CACHE_CONTROL, "no-cache"),
+            (header::CONTENT_TYPE, ctype.to_string()),
+            (header::CONTENT_LENGTH, len.to_string()),
+            (header::CACHE_CONTROL, "public, max-age=3600, immutable".to_string()),
         ],
-        bytes,
+        Body::from_stream(stream),
     )
         .into_response()
 }
@@ -428,10 +498,18 @@ async fn api_subtitle_vtt(
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
 
-    match extract_subtitle_vtt(std::path::Path::new(&item.path), track).await {
+    let subs_dir = state.data_dir.join("subs");
+    match state
+        .transcoder
+        .extract_subtitle_cached(id, std::path::Path::new(&item.path), track, &subs_dir)
+        .await
+    {
         Ok(vtt) => (
             StatusCode::OK,
-            [(header::CONTENT_TYPE, "text/vtt; charset=utf-8")],
+            [
+                (header::CONTENT_TYPE, "text/vtt; charset=utf-8"),
+                (header::CACHE_CONTROL, "public, max-age=604800"),
+            ],
             vtt,
         )
             .into_response(),
@@ -548,21 +626,28 @@ async fn main() -> anyhow::Result<()> {
         server_id: cfg.server_id.clone(),
         public_url: cfg.public_url.clone(),
         web_dir: cfg.web_dir.clone(),
-        scanning: Arc::new(tokio::sync::Mutex::new(false)),
+        scanning: Arc::new(AtomicBool::new(false)),
     };
 
     if cfg.scan_on_startup {
         let scan_db = db.clone();
         let scan_root = cfg.media_dir.clone();
+        let scan_flag = state.scanning.clone();
         let enrich_art = state.artwork.clone();
         let enrich_db = db.clone();
         tokio::spawn(async move {
-            let _ = tokio::task::spawn_blocking(move || {
-                if let Err(e) = scanner::scan_library(&scan_db, &scan_root) {
-                    error!("Initial scan error: {}", e);
-                }
-            })
-            .await;
+            if scan_flag
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Err(e) = scanner::scan_library(&scan_db, &scan_root) {
+                        error!("Initial scan error: {}", e);
+                    }
+                })
+                .await;
+                scan_flag.store(false, Ordering::SeqCst);
+            }
             enrich_art.enrich_missing_movie_genres(&enrich_db).await;
             enrich_art.enrich_missing_show_genres(&enrich_db).await;
         });
@@ -613,7 +698,14 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    axum::serve(listener, ServiceExt::<Request>::into_make_service(app)).await?;
+    let shutdown_tc = transcoder.clone();
+    axum::serve(listener, ServiceExt::<Request>::into_make_service(app))
+        .with_graceful_shutdown(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            info!("Shutting down: stopping all active HLS sessions...");
+            shutdown_tc.stop_all_sessions().await;
+        })
+        .await?;
     Ok(())
 }
 
@@ -641,7 +733,7 @@ mod tests {
             server_id: "test-id-01".to_string(),
             public_url: "http://127.0.0.1:8275".to_string(),
             web_dir,
-            scanning: Arc::new(tokio::sync::Mutex::new(false)),
+            scanning: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -695,6 +787,67 @@ hw_accel = false
         assert_eq!(tv2.show_name.as_deref(), Some("Cyberpunk Edgerunners"));
         assert_eq!(tv2.season, Some(2));
         assert_eq!(tv2.episode, Some(5));
+
+        // Edition stripping & TV trailing-year normalization
+        let akira = scanner::parse_media_path(
+            &root,
+            &PathBuf::from("/media/Movies/Akira - 30th Anniversary/[Reaktor] Akira - 30th Anniversary [1080p][x265].mkv"),
+        );
+        assert_eq!(akira.kind, "movie");
+        assert_eq!(akira.title, "Akira");
+
+        let lanterns = scanner::parse_media_path(
+            &root,
+            &PathBuf::from("/media/TV/Lanterns.2026.S01E03.1080p.HEVC.x265-MeGusta.mkv"),
+        );
+        assert_eq!(lanterns.kind, "episode");
+        assert_eq!(lanterns.show_name.as_deref(), Some("Lanterns"));
+    }
+
+    #[test]
+    fn test_vaapi_codec_guard_and_range_parser() {
+        assert!(TranscodeManager::vaapi_decode_supported("hevc"));
+        assert!(TranscodeManager::vaapi_decode_supported("h264"));
+        assert!(!TranscodeManager::vaapi_decode_supported("mpeg4"));
+        assert!(!TranscodeManager::vaapi_decode_supported("vc1"));
+
+        // RFC 9110 range parsing: normal, open-ended, suffix, and OOB
+        assert_eq!(parse_byte_range("bytes=0-9", 36), Some(Ok((0, 9))));
+        assert_eq!(parse_byte_range("bytes=10-", 36), Some(Ok((10, 35))));
+        assert_eq!(parse_byte_range("bytes=-6", 36), Some(Ok((30, 35))));
+        assert_eq!(parse_byte_range("bytes=100-200", 36), Some(Err(())));
+        assert_eq!(parse_byte_range("bytes=20-10", 36), Some(Err(())));
+    }
+
+    #[tokio::test]
+    async fn test_orphaned_scratch_cleanup_and_diagnostics_toggle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hls_root = tmp.path().join("hls");
+        let orphan = hls_root.join("orphaned-session-123");
+        std::fs::create_dir_all(&orphan).unwrap();
+        std::fs::write(orphan.join("seg_00001.ts"), b"stale").unwrap();
+
+        let diag = Diagnostics::new(true);
+        let _tc = TranscodeManager::new(hls_root.clone(), false, None, 4, diag.clone());
+        assert!(!orphan.exists(), "Orphaned /dev/shm HLS dir must be purged on startup");
+
+        let app = middleware::from_fn(normalize_double_slashes).layer(build_router(test_state(&tmp)));
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/diagnostics/toggle")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"enabled":false}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["enabled"], false);
     }
 
     #[tokio::test]
@@ -761,7 +914,9 @@ hw_accel = false
         assert_eq!(cont[0].position_secs, 300.0);
 
         let app = build_router(state);
+        // Standard range
         let resp = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri(format!("/api/stream/{}/direct", id))
@@ -774,5 +929,114 @@ hw_accel = false
         assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&bytes[..], b"0123456789");
+
+        // Suffix range (MP4 moov atom at EOF)
+        let resp_suf = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/stream/{}/direct", id))
+                    .header(header::RANGE, "bytes=-6")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_suf.status(), StatusCode::PARTIAL_CONTENT);
+        let suf_bytes = resp_suf.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&suf_bytes[..], b"uvwxyz");
+
+        // Out-of-bounds range -> 416 Range Not Satisfiable
+        let resp_oob = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/stream/{}/direct", id))
+                    .header(header::RANGE, "bytes=9999-")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_oob.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    }
+
+    #[tokio::test]
+    async fn test_ffmpeg_e2e_hls_stream_and_session_cleanup() {
+        // Skip gracefully if ffmpeg is not installed in the build environment
+        if std::process::Command::new("ffmpeg").arg("-version").output().is_err() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let media_dir = tmp.path().join("media").join("Movies");
+        std::fs::create_dir_all(&media_dir).unwrap();
+        let sample_mkv = media_dir.join("Test.Movie.2025.1080p.mkv");
+
+        // Generate a 4-second synthetic test clip (H.264 + AAC)
+        let gen = std::process::Command::new("ffmpeg")
+            .args([
+                "-v", "error", "-y",
+                "-f", "lavfi", "-i", "testsrc=duration=4:size=320x180:rate=24",
+                "-f", "lavfi", "-i", "sine=frequency=440:duration=4",
+                "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac",
+            ])
+            .arg(&sample_mkv)
+            .status()
+            .unwrap();
+        assert!(gen.success(), "Failed to generate synthetic test MKV");
+
+        let state = test_state(&tmp);
+        let report = scanner::scan_library(&state.db, &state.media_root).unwrap();
+        assert_eq!(report.scanned, 1);
+        assert_eq!(report.updated, 1);
+
+        let movies = state.db.list_movies().unwrap();
+        assert_eq!(movies.len(), 1);
+        let mid = movies[0].id;
+
+        // Start HLS stream in CPU mode and verify playlist + segment + session replacement cleanup
+        let s1 = state
+            .transcoder
+            .start_stream(
+                &movies[0],
+                &StartStreamRequest {
+                    start_secs: 0.0,
+                    quality: "cpu".to_string(),
+                    previous_session_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        let sid1 = s1.session_id.expect("HLS session_id expected");
+        assert_eq!(state.transcoder.active_session_count().await, 1);
+
+        let app = build_router(state.clone());
+        let m3u8_resp = app
+            .clone()
+            .oneshot(Request::builder().uri(&s1.stream_url).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(m3u8_resp.status(), StatusCode::OK);
+        let m3u8_body = String::from_utf8_lossy(&m3u8_resp.into_body().collect().await.unwrap().to_bytes()).to_string();
+        assert!(m3u8_body.contains(".ts"), "Playlist must contain .ts segment");
+
+        // Starting a second stream with previous_session_id must clean up the first session
+        let s2 = state
+            .transcoder
+            .start_stream(
+                &movies[0],
+                &StartStreamRequest {
+                    start_secs: 1.0,
+                    quality: "cpu".to_string(),
+                    previous_session_id: Some(sid1),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(state.transcoder.active_session_count().await, 1);
+        if let Some(sid2) = s2.session_id {
+            state.transcoder.stop_session(&sid2).await;
+        }
+        assert_eq!(state.transcoder.active_session_count().await, 0);
+        assert_eq!(movies[0].id, mid);
     }
 }
