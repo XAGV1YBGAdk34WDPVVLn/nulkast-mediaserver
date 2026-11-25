@@ -1,0 +1,33 @@
+services:
+  nulkast-mediaserver:
+    build: .
+    container_name: nulkast-mediaserver
+    restart: unless-stopped
+    network_mode: host
+    devices:
+      - ${DRI_DEVICE:-/dev/dri}:${DRI_DEVICE:-/dev/dri}
+    group_add:
+      - "${VIDEO_GID:-44}"
+      - "${RENDER_GID:-109}"
+    volumes:
+      - ${HOST_MEDIA_DIR:-./media}:/media:ro
+      - ${HOST_DATA_DIR:-./data}:/data
+      - ${HOST_TRANSCODE_DIR:-/dev/shm}:/dev/shm
+    environment:
+      - PORT=${PORT:-8275}
+      - JELLYFIN_COMPAT_PORT=${JELLYFIN_COMPAT_PORT:-8096}
+      - JELLYFIN_COMPAT_VERSION=${JELLYFIN_COMPAT_VERSION:-10.11.5}
+      - DISCOVERY_PORT=${DISCOVERY_PORT:-7359}
+      - SERVER_NAME=${SERVER_NAME:-NulKast MediaServer}
+      - SERVER_ID=${SERVER_ID:-nulkast-mediaserver-01}
+      - PUBLIC_URL=${PUBLIC_URL:-http://localhost:8275}
+      - MEDIA_DIR=/media
+      - DATA_DIR=/data
+      - TRANSCODE_DIR=/dev/shm/nulkast-hls
+      - HW_ACCEL=${HW_ACCEL:-true}
+      - HLS_SEGMENT_SECS=${HLS_SEGMENT_SECS:-4}
+      - IDLE_TIMEOUT_SECS=${IDLE_TIMEOUT_SECS:-900}
+      - DIAGNOSTICS_ENABLED=${DIAGNOSTICS_ENABLED:-true}
+      - ONLINE_ARTWORK=${ONLINE_ARTWORK:-true}
+      - TMDB_API_KEY=${TMDB_API_KEY:-}
+    mem_limit: ${MEM_LIMIT:-512m}

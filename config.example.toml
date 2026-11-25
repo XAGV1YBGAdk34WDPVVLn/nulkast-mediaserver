@@ -1,0 +1,26 @@
+# NulKast MediaServer Configuration (all values can also be overridden by env vars)
+server_name = "NulKast MediaServer"
+server_id = "nulkast-mediaserver-01"
+host = "0.0.0.0"
+port = 8275
+public_url = "http://192.168.1.100:8275"
+
+# Paths (inside container or native Linux host)
+media_dir = "/media"
+data_dir = "/data"
+transcode_dir = "/dev/shm/nulkast-hls"
+web_dir = "/app/web"
+
+# Hardware Acceleration & Streaming
+hw_accel = true
+# Leave unset to auto-detect /dev/dri/renderD128
+# vaapi_device = "/dev/dri/renderD128"
+hls_segment_secs = 4
+idle_timeout_secs = 900
+scan_on_startup = true
+
+# Toggleable diagnostics & online artwork/genres
+diagnostics_enabled = true
+online_artwork = true
+# Optional: set a free TMDB API key (otherwise uses local files -> TVMaze / IMDb / Wikidata)
+# tmdb_api_key = ""

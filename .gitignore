@@ -1,0 +1,22 @@
+# Rust build artifacts
+/target/
+Cargo.lock
+
+# Local runtime data, SQLite DB, cached posters & thumbnails
+/data/
+*.db
+*.db-shm
+*.db-wal
+
+# Local host-specific configuration & secrets
+.env
+.env.local
+config.toml
+
+# Local agent workspace metadata
+.agents/
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+*.swp
