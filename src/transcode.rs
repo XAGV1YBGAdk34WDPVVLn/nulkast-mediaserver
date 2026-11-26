@@ -252,6 +252,8 @@ impl TranscodeManager {
 
         match mode {
             "remux" => {
+                // 45s instant RAM burst + 4x realtime pacing so playback has a massive runway while /dev/shm stays bounded
+                cmd.args(["-readrate", "4.0", "-readrate_initial_burst", "45"]);
                 if req.start_secs > 0.0 {
                     cmd.args(["-ss", &format!("{:.2}", req.start_secs)]);
                 }
@@ -267,8 +269,8 @@ impl TranscodeManager {
                     .vaapi_device
                     .as_ref()
                     .ok_or_else(|| anyhow!("No VA-API device"))?;
-                // Pace transcode at 2.5x realtime after an initial 24s fast burst so /dev/shm stays bounded
-                cmd.args(["-readrate", "2.5", "-readrate_initial_burst", "24"])
+                // 36s instant RAM burst + 3x realtime pacing so GPU builds a deep runway ahead of playback
+                cmd.args(["-readrate", "3.0", "-readrate_initial_burst", "36"])
                     .args(["-hwaccel", "vaapi"])
                     .args(["-vaapi_device", &dev.to_string_lossy()])
                     .args(["-hwaccel_output_format", "vaapi"]);

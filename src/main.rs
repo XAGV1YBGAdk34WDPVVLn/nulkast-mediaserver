@@ -355,8 +355,8 @@ fn parse_byte_range(header_val: &str, file_size: u64) -> Option<Result<(u64, u64
             return Some(Err(()));
         }
         let end = if end_s.is_empty() {
-            // Generous 16 MB open-ended chunk for smooth high-bitrate playback
-            (start + 16 * 1024 * 1024 - 1).min(file_size - 1)
+            // Stream continuously to EOF (matches Plex/nginx; avoids forced reconnects on 16MB boundaries)
+            file_size - 1
         } else {
             let parsed_end: u64 = end_s.parse().ok()?;
             if parsed_end < start {
@@ -368,7 +368,33 @@ fn parse_byte_range(header_val: &str, file_size: u64) -> Option<Result<(u64, u64
     }
 }
 
-/// Full RFC 9110 HTTP Range (206 Partial Content / 416 Range Not Satisfiable) direct byte-streaming.
+/// Decouples USB/spinning-disk I/O from the network socket with a 24 MiB RAM read-ahead ring buffer
+/// and 512 KiB sequential reads so disk seek/copy spikes never stall playback.
+fn spawn_readahead_body(mut file: File, len: u64) -> Body {
+    use tokio::io::AsyncWriteExt;
+    let ring_cap = (len as usize).min(24 * 1024 * 1024).max(512 * 1024);
+    let (mut writer, reader) = tokio::io::duplex(ring_cap);
+    tokio::spawn(async move {
+        let mut remaining = len;
+        let mut buf = vec![0u8; 512 * 1024];
+        while remaining > 0 {
+            let to_read = (remaining as usize).min(buf.len());
+            match tokio::io::AsyncReadExt::read(&mut file, &mut buf[..to_read]).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if writer.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                    remaining -= n as u64;
+                }
+            }
+        }
+    });
+    Body::from_stream(ReaderStream::with_capacity(reader, 512 * 1024))
+}
+
+/// Full RFC 9110 HTTP Range (206 Partial Content / 416 Range Not Satisfiable) direct byte-streaming
+/// with 24 MiB RAM read-ahead, ETag validation, and full-EOF continuous streaming.
 async fn api_direct_stream(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -383,10 +409,12 @@ async fn api_direct_stream(
         Ok(f) => f,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
-    let file_size = match file.metadata().await {
-        Ok(m) => m.len(),
+    let meta = match file.metadata().await {
+        Ok(m) => m,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
+    let file_size = meta.len();
+    let etag = format!("\"{}-{}\"", item.mtime, file_size);
 
     let content_type = mime_guess::from_path(&item.path)
         .first_or_octet_stream()
@@ -398,7 +426,6 @@ async fn api_direct_stream(
                 Ok((start, end)) => {
                     let len = end - start + 1;
                     if file.seek(SeekFrom::Start(start)).await.is_ok() {
-                        let stream = ReaderStream::with_capacity(file.take(len), 64 * 1024);
                         return (
                             StatusCode::PARTIAL_CONTENT,
                             [
@@ -406,8 +433,10 @@ async fn api_direct_stream(
                                 (header::ACCEPT_RANGES, "bytes".to_string()),
                                 (header::CONTENT_LENGTH, len.to_string()),
                                 (header::CONTENT_RANGE, format!("bytes {}-{}/{}", start, end, file_size)),
+                                (header::ETAG, etag),
+                                (header::CACHE_CONTROL, "private, max-age=3600".to_string()),
                             ],
-                            Body::from_stream(stream),
+                            spawn_readahead_body(file, len),
                         )
                             .into_response();
                     }
@@ -423,15 +452,16 @@ async fn api_direct_stream(
         }
     }
 
-    let stream = ReaderStream::with_capacity(file, 64 * 1024);
     (
         StatusCode::OK,
         [
             (header::CONTENT_TYPE, content_type),
             (header::ACCEPT_RANGES, "bytes".to_string()),
             (header::CONTENT_LENGTH, file_size.to_string()),
+            (header::ETAG, etag),
+            (header::CACHE_CONTROL, "private, max-age=3600".to_string()),
         ],
-        Body::from_stream(stream),
+        spawn_readahead_body(file, file_size),
     )
         .into_response()
 }
@@ -1419,6 +1449,7 @@ hw_accel = false
         // RFC 9110 range parsing: normal, open-ended, suffix, and OOB
         assert_eq!(parse_byte_range("bytes=0-9", 36), Some(Ok((0, 9))));
         assert_eq!(parse_byte_range("bytes=10-", 36), Some(Ok((10, 35))));
+        assert_eq!(parse_byte_range("bytes=0-", 2_000_000_000), Some(Ok((0, 1_999_999_999))));
         assert_eq!(parse_byte_range("bytes=-6", 36), Some(Ok((30, 35))));
         assert_eq!(parse_byte_range("bytes=100-200", 36), Some(Err(())));
         assert_eq!(parse_byte_range("bytes=20-10", 36), Some(Err(())));

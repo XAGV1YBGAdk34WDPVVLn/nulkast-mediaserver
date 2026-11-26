@@ -1137,9 +1137,12 @@
       armStallWatchdog();
     } else if (window.Hls && window.Hls.isSupported()) {
       const hls = new window.Hls({
-        maxBufferLength: 60,
-        maxMaxBufferLength: 180,
+        maxBufferLength: 90,
+        maxMaxBufferLength: 240,
         backBufferLength: 30,
+        maxBufferHole: 1.0,
+        fragLoadingMaxRetry: 6,
+        manifestLoadingMaxRetry: 6,
         lowLatencyMode: false,
       });
       state.hls = hls;
