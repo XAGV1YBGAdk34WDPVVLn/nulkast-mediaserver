@@ -217,13 +217,16 @@
 
   function armStallWatchdog() {
     clearStallWatchdog();
-    if (videoEl.paused || playerOverlay.classList.contains('hidden') || !state.currentMedia) return;
+    if (playerOverlay.classList.contains('hidden') || !state.currentMedia) return;
+    if (videoEl.paused && !videoEl.seeking) return;
     const snapTime = videoEl.currentTime;
     state.stallTimer = setTimeout(() => {
-      if (videoEl.paused || playerOverlay.classList.contains('hidden') || !state.currentMedia) return;
-      if (Math.abs(videoEl.currentTime - snapTime) > 0.25) return;
+      if (playerOverlay.classList.contains('hidden') || !state.currentMedia) return;
+      if (videoEl.paused && !videoEl.seeking) return;
+      if (!videoEl.seeking && Math.abs(videoEl.currentTime - snapTime) > 0.25) return;
       state.stallRecoveries += 1;
-      clientLog('warn', `Playback stalled at ${absCurrentTime().toFixed(1)}s (recovery #${state.stallRecoveries})`);
+      const pos = absCurrentTime();
+      clientLog('warn', `Playback stalled at ${pos.toFixed(1)}s mode=${state.currentMode} (recovery #${state.stallRecoveries})`);
       if (state.hls && state.stallRecoveries === 1) {
         showSpinner('Recovering stream...');
         try {
@@ -231,12 +234,18 @@
           state.hls.startLoad();
         } catch {}
         armStallWatchdog();
+      } else if (state.currentMode === 'direct' && state.stallRecoveries === 1) {
+        showSpinner('Reloading direct stream...');
+        playMedia(state.currentMedia, QUALITIES[state.qualityIdx].value, pos, true, true);
+      } else if (state.currentMode === 'direct' && state.stallRecoveries === 2) {
+        showSpinner('Switching to RAM HLS stream...');
+        playMedia(state.currentMedia, 'remux', pos, true, true);
       } else if (state.stallRecoveries <= 2) {
         showSpinner('Reloading stream...');
-        const pos = absCurrentTime();
         playMedia(state.currentMedia, QUALITIES[state.qualityIdx].value, pos, true, true);
       } else {
-        showErrorBanner('Stream stalled while buffering. Try Retry, 720p, or CPU Mode.');
+        hideSpinner();
+        showErrorBanner('Stream stalled while buffering/seeking. Try Retry, 720p, or CPU Mode.');
       }
     }, 12000);
   }
@@ -819,10 +828,10 @@
     if (updateUrl) syncUrl(true);
   }
 
-  async function stopActiveSession(sendDelete = true) {
+  async function stopActiveSession(sendDelete = true, preserveRetries = false) {
     clearUpNext();
     clearStallWatchdog();
-    state.stallRecoveries = 0;
+    if (!preserveRetries) state.stallRecoveries = 0;
     state.hudHovered = false;
     if (state.progressTimer) { clearInterval(state.progressTimer); state.progressTimer = null; }
     if (state.statsTimer) { clearInterval(state.statsTimer); state.statsTimer = null; }
@@ -1045,8 +1054,11 @@
   }
 
   async function playMedia(item, qualityOverride = null, startOverride = null, isRetry = false, preserveSub = false) {
-    const prevSid = await stopActiveSession(false);
-    if (!isRetry) state.retryCount = 0;
+    const prevSid = await stopActiveSession(false, isRetry);
+    if (!isRetry) {
+      state.retryCount = 0;
+      state.stallRecoveries = 0;
+    }
 
     const sameMedia = state.currentMedia && state.currentMedia.id === item.id;
     const savedSubIdx = (preserveSub || isRetry || sameMedia) ? state.activeSubIdx : -1;
@@ -1107,11 +1119,22 @@
     clientLog('info', `Playing media=${item.id} mode=${resp.mode} hw=${resp.hw_accel} start=${startSecs.toFixed(0)}s`);
 
     if (resp.mode === 'direct') {
-      videoEl.src = resp.stream_url;
+      const bust = `${resp.stream_url}${resp.stream_url.includes('?') ? '&' : '?'}r=${Date.now()}`;
       if (startSecs > 0) {
-        videoEl.addEventListener('loadedmetadata', () => { videoEl.currentTime = startSecs; }, { once: true });
+        videoEl.addEventListener('loadedmetadata', () => {
+          videoEl.addEventListener('seeked', () => {
+            hideSpinner();
+            videoEl.play().catch((err) => clientLog('warn', `Autoplay blocked: ${err.message}`));
+          }, { once: true });
+          videoEl.currentTime = startSecs;
+          armStallWatchdog();
+        }, { once: true });
+        videoEl.src = bust;
+      } else {
+        videoEl.src = bust;
+        videoEl.play().catch((err) => clientLog('warn', `Autoplay blocked: ${err.message}`));
       }
-      videoEl.play().catch((err) => clientLog('warn', `Autoplay blocked: ${err.message}`));
+      armStallWatchdog();
     } else if (window.Hls && window.Hls.isSupported()) {
       const hls = new window.Hls({
         maxBufferLength: 60,
@@ -1151,7 +1174,8 @@
 
   // Video element lifecycle hooks
   videoEl.addEventListener('waiting', () => { showSpinner('Buffering...'); armStallWatchdog(); });
-  videoEl.addEventListener('seeking', () => showSpinner('Seeking...'));
+  videoEl.addEventListener('seeking', () => { showSpinner('Seeking...'); armStallWatchdog(); });
+  videoEl.addEventListener('seeked', () => { if (!videoEl.paused) hideSpinner(); });
   videoEl.addEventListener('playing', () => { clearStallWatchdog(); state.stallRecoveries = 0; hideSpinner(); btnPlayPause.textContent = '⏸ Pause'; pokePlayerUi(); });
   videoEl.addEventListener('timeupdate', () => { if (!videoEl.paused && videoEl.readyState >= 3) clearStallWatchdog(); });
   videoEl.addEventListener('canplay', () => hideSpinner());

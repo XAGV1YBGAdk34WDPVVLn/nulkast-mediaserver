@@ -139,16 +139,28 @@ async function run() {
       };
       navigator.getGamepads = () => (window.__xboxPad.connected ? [window.__xboxPad, null, null, null] : [null, null, null, null]);
 
-      // Mock <video> play/pause/currentTime so headless Chromium simulates real active playback at t=600s
+      // Mock <video> play/pause/currentTime/src so headless Chromium simulates real active playback at t=600s
       let _paused = true;
       let _time = 600;
       let _duration = 5400;
+      let _src = '';
       Object.defineProperty(HTMLMediaElement.prototype, 'paused', { get: () => _paused, configurable: true });
       Object.defineProperty(HTMLMediaElement.prototype, 'duration', { get: () => _duration, configurable: true });
       Object.defineProperty(HTMLMediaElement.prototype, 'readyState', { get: () => 4, configurable: true });
+      Object.defineProperty(HTMLMediaElement.prototype, 'src', {
+        get: () => _src,
+        set(v) {
+          _src = String(v || '');
+          if (_src) setTimeout(() => this.dispatchEvent(new Event('loadedmetadata')), 10);
+        },
+        configurable: true,
+      });
       Object.defineProperty(HTMLMediaElement.prototype, 'currentTime', {
         get: () => _time,
-        set: (v) => { _time = Number(v) || 0; },
+        set(v) {
+          _time = Number(v) || 0;
+          setTimeout(() => this.dispatchEvent(new Event('seeked')), 10);
+        },
         configurable: true,
       });
       HTMLMediaElement.prototype.play = function () {
