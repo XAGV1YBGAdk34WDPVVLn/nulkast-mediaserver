@@ -58,6 +58,16 @@ pub struct LibraryStats {
     pub total_size_bytes: i64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct DownloadHistoryEntry {
+    pub id: i64,
+    pub title: String,
+    pub category: String,
+    pub torrent_count: i64,
+    pub status: String,
+    pub created_at: String,
+}
+
 #[derive(Clone)]
 pub struct Db {
     conn: Arc<Mutex<Connection>>,
@@ -106,6 +116,15 @@ impl Db {
                 position_secs REAL NOT NULL DEFAULT 0.0,
                 watched INTEGER NOT NULL DEFAULT 0,
                 last_played TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS download_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                category TEXT NOT NULL DEFAULT 'Movies',
+                torrent_count INTEGER NOT NULL DEFAULT 1,
+                status TEXT NOT NULL DEFAULT 'queued',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
             CREATE INDEX IF NOT EXISTS idx_media_kind ON media_items(kind);
@@ -479,6 +498,36 @@ impl Db {
             params![media_id, position_secs.max(0.0), if is_watched { 1 } else { 0 }],
         )?;
         Ok(())
+    }
+
+    pub fn record_download(&self, title: &str, category: &str, torrent_count: i64, status: &str) -> Result<()> {
+        let conn = self.lock_conn();
+        conn.execute(
+            "INSERT INTO download_history (title, category, torrent_count, status) VALUES (?1, ?2, ?3, ?4)",
+            params![title, category, torrent_count, status],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_download_history(&self, limit: i64) -> Result<Vec<DownloadHistoryEntry>> {
+        let conn = self.lock_conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, title, category, torrent_count, status, created_at
+             FROM download_history
+             ORDER BY id DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |r| {
+            Ok(DownloadHistoryEntry {
+                id: r.get(0)?,
+                title: r.get(1)?,
+                category: r.get(2)?,
+                torrent_count: r.get(3)?,
+                status: r.get(4)?,
+                created_at: r.get(5)?,
+            })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
     pub fn stats(&self) -> Result<LibraryStats> {

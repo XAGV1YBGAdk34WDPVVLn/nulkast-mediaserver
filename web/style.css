@@ -353,7 +353,7 @@ h2 {
   top: 0;
   left: 0;
   right: 0;
-  z-index: 10;
+  z-index: 25;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -393,6 +393,12 @@ video::cue {
   gap: 14px;
   background: rgba(0, 0, 0, 0.45);
   pointer-events: auto;
+}
+#player-spinner {
+  pointer-events: none;
+}
+#player-error-banner {
+  z-index: 30;
 }
 .spinner {
   width: 54px;
@@ -443,7 +449,7 @@ video::cue {
   bottom: 0;
   left: 0;
   right: 0;
-  z-index: 10;
+  z-index: 25;
   padding: 14px 24px 20px;
   background: linear-gradient(0deg, rgba(0,0,0,0.95) 0%, rgba(0,0,0,0) 100%);
   transition: opacity 0.25s ease;
@@ -558,4 +564,232 @@ video::cue {
 @media (min-width: 1600px) {
   html { font-size: 17px; }
   .card-grid { grid-template-columns: repeat(auto-fill, minmax(215px, 1fr)); gap: 20px; }
+}
+
+/* Discover Tab & Torrent Download Modal */
+.discover-status {
+  margin-bottom: 14px;
+  padding: 10px 14px;
+  border-radius: 10px;
+  background: rgba(56, 189, 248, 0.12);
+  border: 1px solid rgba(56, 189, 248, 0.35);
+  color: #bae6fd;
+  font-size: 0.9rem;
+}
+.discover-status.error {
+  background: rgba(244, 63, 94, 0.14);
+  border-color: rgba(244, 63, 94, 0.45);
+  color: #fecdd3;
+}
+.card-badge-overlay {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 3;
+  padding: 3px 8px;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 800;
+  letter-spacing: 0.03em;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.65);
+}
+.card-badge-overlay.owned {
+  background: rgba(16, 185, 129, 0.92);
+  color: #041b12;
+}
+.card-badge-overlay.download {
+  background: rgba(56, 189, 248, 0.92);
+  color: #061826;
+}
+.card-badge-overlay.downloading {
+  background: rgba(251, 191, 36, 0.95);
+  color: #1c1202;
+}
+.discover-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  background: rgba(6, 10, 18, 0.84);
+  backdrop-filter: blur(6px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+.discover-modal-card {
+  background: #131a27;
+  border: 2px solid rgba(56, 189, 248, 0.45);
+  border-radius: 16px;
+  width: min(920px, 96vw);
+  max-height: 88vh;
+  display: flex;
+  flex-direction: column;
+  padding: 20px 24px;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.8);
+  overflow: hidden;
+}
+.discover-modal-head {
+  display: flex;
+  gap: 18px;
+  align-items: flex-start;
+  margin-bottom: 14px;
+}
+.dmodal-poster {
+  width: 112px;
+  aspect-ratio: 2 / 3;
+  object-fit: cover;
+  border-radius: 10px;
+  background: #0b0f17;
+  flex-shrink: 0;
+}
+.dmodal-info {
+  flex: 1;
+  min-width: 0;
+}
+.dmodal-title-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+}
+.dmodal-title {
+  margin: 0 0 4px 0;
+  font-size: 1.25rem;
+  font-weight: 800;
+}
+.dmodal-meta {
+  font-size: 0.85rem;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+.dmodal-summary {
+  margin: 0 0 12px 0;
+  font-size: 0.88rem;
+  color: #cbd5e1;
+  line-height: 1.4;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.dmodal-status {
+  font-size: 0.88rem;
+  color: #7dd3fc;
+  margin-bottom: 10px;
+  min-height: 1.2em;
+}
+.dmodal-status.error { color: #fda4af; }
+.dmodal-status.ok { color: #6ee7b7; }
+.dmodal-results {
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-right: 4px;
+}
+.dmodal-result-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: #1b2436;
+  border: 2px solid rgba(255,255,255,0.06);
+  border-radius: 10px;
+  padding: 10px 14px;
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+}
+.dmodal-result-row:hover,
+.dmodal-result-row:focus {
+  background: #232f46;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-glow);
+  outline: none;
+}
+.dmodal-result-row:focus .pill,
+.dmodal-result-row:hover .pill {
+  background: var(--accent);
+  color: #061018;
+  border-color: var(--accent);
+}
+.dmodal-result-row.queued {
+  border-color: var(--green);
+  background: rgba(52, 211, 153, 0.1);
+}
+.dmodal-result-row.queued .pill {
+  background: var(--green);
+  color: #041b12;
+  border-color: var(--green);
+}
+.dmodal-result-name {
+  font-size: 0.9rem;
+  font-weight: 600;
+  word-break: break-word;
+}
+.dmodal-result-meta {
+  font-size: 0.78rem;
+  color: var(--muted);
+  margin-top: 3px;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.transfer-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  background: var(--panel);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 12px;
+  padding: 12px 16px;
+}
+
+.dmodal-release-title {
+  font-size: 0.78rem;
+  color: #94a3b8;
+  margin-top: 4px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.poster-wrap {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 2 / 3;
+  background: linear-gradient(135deg, #1b2436, #0d121c);
+  overflow: hidden;
+  flex-shrink: 0;
+}
+.poster-img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.discover-badge {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  z-index: 2;
+  padding: 3px 9px;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 800;
+  letter-spacing: 0.03em;
+  background: rgba(2, 132, 199, 0.92);
+  color: #fff;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.45);
+}
+.discover-badge.owned {
+  background: rgba(16, 185, 129, 0.92);
+}
+.discover-badge.downloading {
+  background: rgba(245, 158, 11, 0.95);
+  color: #111827;
 }

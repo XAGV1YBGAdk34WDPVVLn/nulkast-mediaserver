@@ -4,6 +4,8 @@ mod db;
 mod diagnostics;
 mod jellyfin_compat;
 mod scanner;
+mod subtitles;
+mod torrent;
 mod transcode;
 
 use axum::{
@@ -32,6 +34,7 @@ use tokio_util::io::ReaderStream;
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 use tracing::{error, info};
+use torrent::TorrentProxy;
 use transcode::{StartStreamRequest, TranscodeManager};
 
 #[derive(Clone)]
@@ -41,6 +44,7 @@ pub struct AppState {
     pub data_dir: PathBuf,
     pub transcoder: TranscodeManager,
     pub artwork: ArtworkManager,
+    pub torrent: TorrentProxy,
     pub diag: Diagnostics,
     pub server_name: String,
     pub server_id: String,
@@ -90,6 +94,7 @@ async fn api_health(State(state): State<AppState>) -> impl IntoResponse {
         "server_name": state.server_name,
         "hw_vaapi": state.transcoder.vaapi_device.is_some(),
         "diagnostics_enabled": state.diag.is_enabled(),
+        "discover_enabled": state.torrent.is_enabled(),
         "scratch_dir": state.transcoder.scratch_root,
         "active_transcode_sessions": active_sessions,
         "library": stats
@@ -538,12 +543,541 @@ async fn normalize_double_slashes(mut req: Request, next: Next) -> impl IntoResp
 async fn log_requests(req: Request, next: Next) -> impl IntoResponse {
     let method = req.method().clone();
     let uri = req.uri().clone();
-    let resp = next.run(req).await;
+    let path = uri.path().to_string();
+    let mut resp = next.run(req).await;
+    if path == "/" || path == "/web" || path == "/web/" || path.ends_with(".html") {
+        resp.headers_mut().insert(
+            header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-cache, no-store, must-revalidate"),
+        );
+    }
     let status = resp.status();
-    if status != StatusCode::OK || !uri.path().starts_with("/api/hls/") {
+    if status != StatusCode::OK || !path.starts_with("/api/hls/") {
         info!("HTTP {} {} -> {}", method, uri, status.as_u16());
     }
     resp
+}
+
+#[derive(Deserialize)]
+struct DiscoverFeedQuery {
+    force: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct DiscoverIdQuery {
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct DiscoverTvPlanQuery {
+    show: String,
+    season: u32,
+    #[serde(rename = "showId")]
+    show_id: Option<String>,
+    quality: Option<String>,
+    #[serde(rename = "skipPacks")]
+    skip_packs: Option<bool>,
+    #[serde(rename = "sameGroup")]
+    same_group: Option<bool>,
+    #[serde(rename = "skipOwned")]
+    skip_owned: Option<bool>,
+    force: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct DiscoverTvSearchQuery {
+    q: String,
+}
+
+#[derive(Deserialize)]
+struct DiscoverSearchStartBody {
+    query: String,
+    category: Option<String>,
+    kind: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DiscoverSearchResultsQuery {
+    id: i64,
+}
+
+#[derive(Deserialize)]
+struct DiscoverDownloadBody {
+    urls: Vec<String>,
+    category: Option<String>,
+    title: Option<String>,
+}
+
+async fn api_discover_ui_js(State(state): State<AppState>) -> impl IntoResponse {
+    if !state.torrent.is_enabled() {
+        return (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/javascript; charset=utf-8"),
+                (header::CACHE_CONTROL, "no-cache"),
+            ],
+            Vec::<u8>::new(),
+        )
+            .into_response();
+    }
+    match state.torrent.get_bytes("/scripts/discover-shared.js", 8).await {
+        Ok((200, bytes)) if !bytes.is_empty() => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/javascript; charset=utf-8"),
+                (header::CACHE_CONTROL, "no-cache, no-store, must-revalidate"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        _ => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/javascript; charset=utf-8"),
+                (header::CACHE_CONTROL, "no-cache"),
+            ],
+            Vec::<u8>::new(),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_discover_status(State(state): State<AppState>) -> impl IntoResponse {
+    if !state.torrent.is_enabled() {
+        return Json(json!({ "enabled": false, "reachable": false, "active_downloads": 0 })).into_response();
+    }
+    match state.torrent.get_json("/api/v2/torrents/info?filter=active", 4).await {
+        Ok(v) => {
+            let count = v.as_array().map(|a| a.len()).unwrap_or(0);
+            Json(json!({ "enabled": true, "reachable": true, "active_downloads": count })).into_response()
+        }
+        Err(e) => Json(json!({
+            "enabled": true,
+            "reachable": false,
+            "active_downloads": 0,
+            "error": e.to_string()
+        }))
+        .into_response(),
+    }
+}
+
+async fn api_discover_movies(
+    State(state): State<AppState>,
+    Query(q): Query<DiscoverFeedQuery>,
+) -> impl IntoResponse {
+    if !state.torrent.is_enabled() {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": "Discover is not configured (set TORRENT_API_URL)" }))).into_response();
+    }
+    let path = if q.force.unwrap_or(false) {
+        "/api/v2/movies/feed?force=true"
+    } else {
+        "/api/v2/movies/feed"
+    };
+    match state.torrent.get_json(path, 10).await {
+        Ok(mut payload) => {
+            let local: Vec<(i64, String, Option<i64>)> = state
+                .db
+                .list_movies_filtered("az", None)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|m| (m.id, m.title, m.year))
+                .collect();
+            TorrentProxy::annotate_movies(&mut payload, &local);
+            (StatusCode::OK, Json(payload)).into_response()
+        }
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": e.to_string() }))).into_response(),
+    }
+}
+
+async fn api_discover_tv(
+    State(state): State<AppState>,
+    Query(q): Query<DiscoverFeedQuery>,
+) -> impl IntoResponse {
+    if !state.torrent.is_enabled() {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": "Discover is not configured (set TORRENT_API_URL)" }))).into_response();
+    }
+    let path = if q.force.unwrap_or(false) {
+        "/api/v2/tv/feed?force=true"
+    } else {
+        "/api/v2/tv/feed"
+    };
+    match state.torrent.get_json(path, 10).await {
+        Ok(mut payload) => {
+            let local: Vec<String> = state
+                .db
+                .list_shows()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| s.show_name)
+                .collect();
+            TorrentProxy::annotate_shows(&mut payload, &local);
+            (StatusCode::OK, Json(payload)).into_response()
+        }
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": e.to_string() }))).into_response(),
+    }
+}
+
+async fn api_discover_tv_episodes(
+    State(state): State<AppState>,
+    Query(q): Query<DiscoverIdQuery>,
+) -> impl IntoResponse {
+    if !state.torrent.is_enabled() {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": "Discover is not configured" }))).into_response();
+    }
+    let id = TorrentProxy::sanitize_id(&q.id);
+    if id.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "Invalid show id" }))).into_response();
+    }
+    match state.torrent.get_json(&format!("/api/v2/tv/episodes?id={}", id), 12).await {
+        Ok(payload) => (StatusCode::OK, Json(payload)).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": e.to_string() }))).into_response(),
+    }
+}
+
+async fn api_discover_tv_plan(
+    State(state): State<AppState>,
+    Query(q): Query<DiscoverTvPlanQuery>,
+) -> impl IntoResponse {
+    if !state.torrent.is_enabled() {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": "Discover is not configured" }))).into_response();
+    }
+    let quality = q.quality.as_deref().unwrap_or("1080p");
+    let mut path = format!(
+        "/api/v2/tv/plan?show={}&season={}&quality={}",
+        TorrentProxy::url_encode(&q.show),
+        q.season,
+        TorrentProxy::url_encode(quality)
+    );
+    if let Some(sid) = q.show_id.as_deref() {
+        let clean = TorrentProxy::sanitize_id(sid);
+        if !clean.is_empty() {
+            path.push_str(&format!("&showId={}", clean));
+        }
+    }
+    if let Some(sp) = q.skip_packs {
+        path.push_str(&format!("&skipPacks={}", sp));
+    }
+    if let Some(sg) = q.same_group {
+        path.push_str(&format!("&sameGroup={}", sg));
+    }
+    if let Some(so) = q.skip_owned {
+        path.push_str(&format!("&skipOwned={}", so));
+    }
+    if q.force.unwrap_or(false) {
+        path.push_str("&force=true");
+    }
+    match state.torrent.get_json(&path, 25).await {
+        Ok(payload) => (StatusCode::OK, Json(payload)).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": e.to_string() }))).into_response(),
+    }
+}
+
+async fn api_discover_tv_search(
+    State(state): State<AppState>,
+    Query(q): Query<DiscoverTvSearchQuery>,
+) -> impl IntoResponse {
+    if !state.torrent.is_enabled() {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": "Discover is not configured" }))).into_response();
+    }
+    let trimmed = q.q.trim();
+    if trimmed.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "Search query cannot be empty" }))).into_response();
+    }
+    let path = format!("/api/v2/tv/search?q={}", TorrentProxy::url_encode(trimmed));
+    match state.torrent.get_json(&path, 15).await {
+        Ok(mut payload) => {
+            let local: Vec<String> = state
+                .db
+                .list_shows()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| s.show_name)
+                .collect();
+            TorrentProxy::annotate_shows(&mut payload, &local);
+            (StatusCode::OK, Json(payload)).into_response()
+        }
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": e.to_string() }))).into_response(),
+    }
+}
+
+async fn api_discover_poster(
+    State(state): State<AppState>,
+    Path((kind, id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    if !state.torrent.is_enabled() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let clean_id = TorrentProxy::sanitize_id(&id);
+    let endpoint = match kind.as_str() {
+        "movies" => format!("/api/v2/movies/poster?id={}", clean_id),
+        "tv" => format!("/api/v2/tv/poster?id={}", clean_id),
+        _ => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    if clean_id.is_empty() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match state.torrent.get_bytes(&endpoint, 8).await {
+        Ok((200, bytes)) if !bytes.is_empty() => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "image/jpeg"),
+                (header::CACHE_CONTROL, "public, max-age=86400"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Ok((202, _)) => StatusCode::ACCEPTED.into_response(),
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn api_discover_search_start(
+    State(state): State<AppState>,
+    Json(body): Json<DiscoverSearchStartBody>,
+) -> impl IntoResponse {
+    if !state.torrent.is_enabled() {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": "Discover is not configured" }))).into_response();
+    }
+    let q = body.query.trim();
+    if q.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "Search query cannot be empty" }))).into_response();
+    }
+    let cat = body.category.as_deref().unwrap_or("all");
+    match state
+        .torrent
+        .post_form(
+            "/api/v2/search/start",
+            &[("pattern", q), ("category", cat), ("plugins", "enabled")],
+            10,
+        )
+        .await
+    {
+        Ok((status, text)) if (200..300).contains(&status) => {
+            let mut parsed: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({ "raw": text }));
+            let fallbacks = TorrentProxy::build_search_fallbacks(q, body.kind.as_deref());
+            if let Some(obj) = parsed.as_object_mut() {
+                obj.insert("query".to_string(), json!(q));
+                obj.insert("fallbacks".to_string(), json!(fallbacks));
+            }
+            (StatusCode::OK, Json(parsed)).into_response()
+        }
+        Ok((status, text)) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": format!("HTTP {}: {}", status, text) }))).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": e.to_string() }))).into_response(),
+    }
+}
+
+async fn api_discover_search_results(
+    State(state): State<AppState>,
+    Query(q): Query<DiscoverSearchResultsQuery>,
+) -> impl IntoResponse {
+    if !state.torrent.is_enabled() {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": "Discover is not configured" }))).into_response();
+    }
+    let path = format!("/api/v2/search/results?id={}&limit=80&offset=0", q.id);
+    match state.torrent.get_json(&path, 10).await {
+        Ok(payload) => {
+            let status_str = payload.get("status").and_then(|v| v.as_str()).unwrap_or("Running");
+            let raw = payload.get("results").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            let ranked = TorrentProxy::rank_search_results(&raw);
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "id": q.id,
+                    "status": status_str,
+                    "total_raw": raw.len(),
+                    "results": ranked
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": e.to_string() }))).into_response(),
+    }
+}
+
+async fn api_discover_download(
+    State(state): State<AppState>,
+    Json(body): Json<DiscoverDownloadBody>,
+) -> impl IntoResponse {
+    if !state.torrent.is_enabled() {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": "Discover is not configured" }))).into_response();
+    }
+    let clean_urls: Vec<String> = body
+        .urls
+        .into_iter()
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty())
+        .collect();
+    if clean_urls.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "No magnet or torrent URLs provided" }))).into_response();
+    }
+    let joined = clean_urls.join("\n");
+    let cat = body.category.as_deref().unwrap_or("Movies");
+    let mut params: Vec<(&str, &str)> = vec![("urls", &joined), ("savepath", "/downloads")];
+    if !cat.is_empty() {
+        params.push(("category", cat));
+    }
+    match state.torrent.post_form("/api/v2/torrents/add", &params, 12).await {
+        Ok((status, text)) if (200..300).contains(&status) => {
+            let label = body.title.as_deref().unwrap_or("torrent");
+            let _ = state.db.record_download(label, cat, clean_urls.len() as i64, "queued");
+            state.diag.record(
+                "info",
+                "discover",
+                format!("Queued {} item(s) for '{}' [{}]", clean_urls.len(), label, cat),
+            );
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "queued": clean_urls.len(),
+                    "category": cat,
+                    "response": text.trim()
+                })),
+            )
+                .into_response()
+        }
+        Ok((status, text)) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": format!("qBittorrent HTTP {}: {}", status, text) }))).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": e.to_string() }))).into_response(),
+    }
+}
+
+async fn api_discover_transfers(State(state): State<AppState>) -> impl IntoResponse {
+    if !state.torrent.is_enabled() {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": "Discover is not configured" }))).into_response();
+    }
+    match state.torrent.get_json("/api/v2/torrents/info?sort=added_on&reverse=true&limit=30", 8).await {
+        Ok(payload) => (StatusCode::OK, Json(json!({ "transfers": payload }))).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": e.to_string() }))).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct SubtitleSearchQuery {
+    lang: Option<String>,
+    q: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SubtitleDownloadBody {
+    sub_id: String,
+    download_url: String,
+    filename: String,
+    language: Option<String>,
+}
+
+async fn api_media_subtitles(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let item = match state.db.get_media(id) {
+        Ok(Some(i)) => i,
+        _ => return (StatusCode::NOT_FOUND, Json(json!({ "error": "Not found" }))).into_response(),
+    };
+    let subs_dir = state.data_dir.join("subs");
+    let tracks = subtitles::list_available_subtitles(&item, &subs_dir);
+    (StatusCode::OK, Json(json!({ "tracks": tracks }))).into_response()
+}
+
+async fn api_media_subtitles_search(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(q): Query<SubtitleSearchQuery>,
+) -> impl IntoResponse {
+    let item = match state.db.get_media(id) {
+        Ok(Some(i)) => i,
+        _ => return (StatusCode::NOT_FOUND, Json(json!({ "error": "Not found" }))).into_response(),
+    };
+    let lang = q.lang.as_deref().unwrap_or("eng");
+    match subtitles::search_online_subtitles(&item, lang, q.q.as_deref()).await {
+        Ok(results) => (StatusCode::OK, Json(json!({ "results": results }))).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": e.to_string() }))).into_response(),
+    }
+}
+
+async fn api_media_subtitles_download(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<SubtitleDownloadBody>,
+) -> impl IntoResponse {
+    if state.db.get_media(id).ok().flatten().is_none() {
+        return (StatusCode::NOT_FOUND, Json(json!({ "error": "Not found" }))).into_response();
+    }
+    let subs_dir = state.data_dir.join("subs");
+    let lang = body.language.as_deref().unwrap_or("English");
+    match subtitles::download_and_cache_subtitle(
+        id,
+        &body.sub_id,
+        &body.download_url,
+        &body.filename,
+        lang,
+        &subs_dir,
+    )
+    .await
+    {
+        Ok(track) => {
+            state.diag.record("info", "subtitles", format!("Downloaded subtitle '{}' for media {}", body.filename, id));
+            (StatusCode::OK, Json(json!({ "track": track }))).into_response()
+        }
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": e.to_string() }))).into_response(),
+    }
+}
+
+async fn api_media_subtitle_file(
+    State(state): State<AppState>,
+    Path((_id, filename)): Path<(i64, String)>,
+) -> impl IntoResponse {
+    if filename.contains('/') || filename.contains('\\') || filename.contains("..") || !filename.ends_with(".vtt") {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let path = state.data_dir.join("subs").join(&filename);
+    match tokio::fs::read_to_string(&path).await {
+        Ok(vtt) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "text/vtt; charset=utf-8"),
+                (header::CACHE_CONTROL, "public, max-age=86400"),
+            ],
+            vtt,
+        )
+            .into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn api_media_subtitle_sidecar(
+    State(state): State<AppState>,
+    Path((id, filename)): Path<(i64, String)>,
+) -> impl IntoResponse {
+    if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let item = match state.db.get_media(id) {
+        Ok(Some(i)) => i,
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    let Some(parent) = std::path::Path::new(&item.path).parent() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let src = parent.join(&filename);
+    match subtitles::convert_file_to_vtt(&src).await {
+        Ok(vtt) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "text/vtt; charset=utf-8"),
+                (header::CACHE_CONTROL, "public, max-age=86400"),
+            ],
+            vtt,
+        )
+            .into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn api_discover_history(State(state): State<AppState>) -> impl IntoResponse {
+    match state.db.list_download_history(60) {
+        Ok(history) => (StatusCode::OK, Json(json!({ "history": history }))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response(),
+    }
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -576,11 +1110,30 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/media/{id}/poster", get(api_media_poster))
         .route("/api/media/{id}/thumb", get(api_media_thumb))
         .route("/api/media/{id}/progress", post(api_update_progress))
+        .route("/api/media/{id}/subtitles", get(api_media_subtitles))
+        .route("/api/media/{id}/subtitles/search", get(api_media_subtitles_search))
+        .route("/api/media/{id}/subtitles/download", post(api_media_subtitles_download))
+        .route("/api/media/{id}/subtitles/file/{filename}", get(api_media_subtitle_file))
+        .route("/api/media/{id}/subtitles/sidecar/{filename}", get(api_media_subtitle_sidecar))
         .route("/api/stream/{id}/start", post(api_start_stream))
         .route("/api/stream/{id}/direct", get(api_direct_stream))
         .route("/api/stream/{id}/subtitles/{track}", get(api_subtitle_vtt))
         .route("/api/hls/{session_id}/{filename}", get(api_hls_file))
         .route("/api/hls/{session_id}", delete(api_stop_session))
+        // Discover & Torrent Download Proxy (optional via TORRENT_API_URL)
+        .route("/api/discover/ui.js", get(api_discover_ui_js))
+        .route("/api/discover/status", get(api_discover_status))
+        .route("/api/discover/movies", get(api_discover_movies))
+        .route("/api/discover/tv", get(api_discover_tv))
+        .route("/api/discover/tv/episodes", get(api_discover_tv_episodes))
+        .route("/api/discover/tv/plan", get(api_discover_tv_plan))
+        .route("/api/discover/tv/search", get(api_discover_tv_search))
+        .route("/api/discover/poster/{kind}/{id}", get(api_discover_poster))
+        .route("/api/discover/search/start", post(api_discover_search_start))
+        .route("/api/discover/search/results", get(api_discover_search_results))
+        .route("/api/discover/download", post(api_discover_download))
+        .route("/api/discover/transfers", get(api_discover_transfers))
+        .route("/api/discover/history", get(api_discover_history))
         // Serve our custom 10-foot Web UI at both /web/* (for Jellyfin Xbox app) and /
         .nest_service("/web", web_service.clone())
         .fallback_service(web_service)
@@ -614,6 +1167,7 @@ async fn main() -> anyhow::Result<()> {
         cfg.online_artwork,
         diag.clone(),
     );
+    let torrent = TorrentProxy::new(cfg.torrent_api_url.clone(), diag.clone());
 
     let state = AppState {
         db: db.clone(),
@@ -621,6 +1175,7 @@ async fn main() -> anyhow::Result<()> {
         data_dir: cfg.data_dir.clone(),
         transcoder: transcoder.clone(),
         artwork,
+        torrent,
         diag,
         server_name: cfg.server_name.clone(),
         server_id: cfg.server_id.clone(),
@@ -650,6 +1205,55 @@ async fn main() -> anyhow::Result<()> {
             }
             enrich_art.enrich_missing_movie_genres(&enrich_db).await;
             enrich_art.enrich_missing_show_genres(&enrich_db).await;
+        });
+    }
+
+    // Periodic incremental library scan (safety net for manual file drops; default every 15 min)
+    if cfg.scan_interval_secs > 0 {
+        let period_secs = cfg.scan_interval_secs.max(60);
+        let p_db = db.clone();
+        let p_root = cfg.media_dir.clone();
+        let p_flag = state.scanning.clone();
+        let p_art = state.artwork.clone();
+        let p_diag = state.diag.clone();
+        info!("Periodic incremental library scan enabled every {}s", period_secs);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(period_secs));
+            interval.tick().await; // skip immediate tick (startup scan already runs)
+            loop {
+                interval.tick().await;
+                if p_flag
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    let db_run = p_db.clone();
+                    let root_run = p_root.clone();
+                    let res = tokio::task::spawn_blocking(move || scanner::scan_library(&db_run, &root_run)).await;
+                    p_flag.store(false, Ordering::SeqCst);
+                    match res {
+                        Ok(Ok(summary)) => {
+                            if summary.scanned > 0 || summary.removed > 0 {
+                                info!(
+                                    "Periodic scan found changes: scanned={} skipped={} removed={}",
+                                    summary.scanned, summary.skipped, summary.removed
+                                );
+                                p_diag.record(
+                                    "info",
+                                    "scan",
+                                    format!(
+                                        "Periodic scan: +{} updated, -{} removed ({} unchanged)",
+                                        summary.scanned, summary.removed, summary.skipped
+                                    ),
+                                );
+                                p_art.enrich_missing_movie_genres(&p_db).await;
+                                p_art.enrich_missing_show_genres(&p_db).await;
+                            }
+                        }
+                        Ok(Err(e)) => error!("Periodic scan error: {}", e),
+                        Err(e) => error!("Periodic scan task join error: {}", e),
+                    }
+                }
+            }
         });
     }
 
@@ -728,6 +1332,7 @@ mod tests {
             data_dir: tmp.path().join("data"),
             transcoder: TranscodeManager::new(tmp.path().join("hls"), false, None, 4, diag.clone()),
             artwork: ArtworkManager::new(tmp.path().join("posters"), None, false, diag.clone()),
+            torrent: TorrentProxy::new(None, diag.clone()),
             diag,
             server_name: "NUC Test".to_string(),
             server_id: "test-id-01".to_string(),

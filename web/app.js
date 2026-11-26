@@ -27,6 +27,8 @@
     qualityIdx: 0,
     subTracks: [],
     activeSubIdx: -1, // index into subTracks, or -1 for Off
+    activeSubOption: null,
+    subOffsetSecs: 0,
     startOffset: 0,
     hls: null,
     retryCount: 0,
@@ -43,7 +45,23 @@
     gamepadRaf: null,
     lastGamepadNav: 0,
     prevPadButtons: [],
+    hudHovered: false,
+    stallTimer: null,
+    stallRecoveries: 0,
     lastStatTick: 0,
+    discoverEnabled: false,
+    discoverMode: 'movies',
+    discoverSort: 'popular',
+    discoverFilter: 'All',
+    discoverMovies: [],
+    discoverTv: [],
+    discoverTransfers: [],
+    discoverJustQueued: new Set(),
+    discoverLoaded: false,
+    discoverPollTimer: null,
+    discoverModalItem: null,
+    discoverSelectedSeason: 1,
+    discoverLastResults: [],
   };
 
   const $ = (id) => document.getElementById(id);
@@ -175,9 +193,52 @@
     playerOverlay.classList.remove('idle-hide');
     if (wasHidden) syncPlayerVisuals(true);
     clearTimeout(hideUiTimer);
-    if (!videoEl.paused && state.scrubTarget === null && $('player-error-banner').classList.contains('hidden')) {
-      hideUiTimer = setTimeout(() => playerOverlay.classList.add('idle-hide'), 4200);
+    if (
+      !videoEl.paused
+      && !state.hudHovered
+      && state.scrubTarget === null
+      && $('player-error-banner').classList.contains('hidden')
+      && $('sub-modal').classList.contains('hidden')
+    ) {
+      hideUiTimer = setTimeout(() => {
+        if (!state.hudHovered && !videoEl.paused && state.scrubTarget === null) {
+          playerOverlay.classList.add('idle-hide');
+        }
+      }, 5500);
     }
+  }
+
+  function clearStallWatchdog() {
+    if (state.stallTimer) {
+      clearTimeout(state.stallTimer);
+      state.stallTimer = null;
+    }
+  }
+
+  function armStallWatchdog() {
+    clearStallWatchdog();
+    if (videoEl.paused || playerOverlay.classList.contains('hidden') || !state.currentMedia) return;
+    const snapTime = videoEl.currentTime;
+    state.stallTimer = setTimeout(() => {
+      if (videoEl.paused || playerOverlay.classList.contains('hidden') || !state.currentMedia) return;
+      if (Math.abs(videoEl.currentTime - snapTime) > 0.25) return;
+      state.stallRecoveries += 1;
+      clientLog('warn', `Playback stalled at ${absCurrentTime().toFixed(1)}s (recovery #${state.stallRecoveries})`);
+      if (state.hls && state.stallRecoveries === 1) {
+        showSpinner('Recovering stream...');
+        try {
+          state.hls.recoverMediaError();
+          state.hls.startLoad();
+        } catch {}
+        armStallWatchdog();
+      } else if (state.stallRecoveries <= 2) {
+        showSpinner('Reloading stream...');
+        const pos = absCurrentTime();
+        playMedia(state.currentMedia, QUALITIES[state.qualityIdx].value, pos, true, true);
+      } else {
+        showErrorBanner('Stream stalled while buffering. Try Retry, 720p, or CPU Mode.');
+      }
+    }, 12000);
   }
 
   function stepScrub(dir, isGamepad = false) {
@@ -405,6 +466,10 @@
         switchTab('shows', false);
         renderShows();
       }
+    } else if (route === 'discover') {
+      state.activeShow = null;
+      switchTab('discover', false);
+      if (state.discoverEnabled) loadDiscoverCatalog(false);
     } else if (route === 'search') {
       const q = params.get('q') || '';
       state.searchQuery = q;
@@ -431,6 +496,8 @@
         document.title = health.server_name;
       }
       state.diagEnabled = !!health.diagnostics_enabled;
+      state.discoverEnabled = !!health.discover_enabled;
+      $('nav-discover')?.classList.toggle('hidden', !state.discoverEnabled);
       $('btn-diag').textContent = state.diagEnabled ? 'Diag: ON' : 'Diag: OFF';
       $('hw-badge').textContent = health.hw_vaapi ? 'INTEL VA-API + RAM HLS' : 'CPU + RAM HLS';
       state.movies = movies.items || [];
@@ -702,6 +769,43 @@
     }
   }
 
+  function fmtBytes(b) {
+    if (!b || b <= 0) return '';
+    const gb = b / (1024 * 1024 * 1024);
+    if (gb >= 1) return `${gb.toFixed(2)} GB`;
+    return `${Math.round(b / (1024 * 1024))} MB`;
+  }
+
+  // Unified Discover module (shared with standalone/Torrent Discover view via discover-shared.js)
+  const discoverEngine = window.NulKastDiscover ? window.NulKastDiscover.create({
+    apiBase: '/api/discover',
+    apiFetch: api,
+    escapeHtml,
+    fmtBytes,
+    renderSkeletons,
+    setLastFocusKey: (k) => { state.lastFocusedKey = k; },
+    onRestoreFocus: (k) => restoreFocusByKey(k || state.lastFocusedKey),
+    onPlayLibraryItem: (item, kind) => {
+      if (kind === 'tv' && item.libraryShowName) {
+        openShow(item.libraryShowName, true);
+      } else if (item.libraryMediaId) {
+        const found = state.movies.find((m) => m.id === item.libraryMediaId);
+        if (found) playMedia(found);
+      }
+    },
+  }) : null;
+  if (discoverEngine) discoverEngine.bindEvents();
+
+  async function loadDiscoverCatalog(force = false) {
+    if (!discoverEngine) return;
+    discoverEngine.state.enabled = state.discoverEnabled;
+    await discoverEngine.loadCatalog(force);
+  }
+
+  function closeDiscoverModal() {
+    if (discoverEngine) discoverEngine.closeModal();
+  }
+
   function switchTab(tab, updateUrl = true) {
     state.tab = tab;
     document.querySelectorAll('.nav-btn[data-tab]').forEach((b) => {
@@ -717,6 +821,9 @@
 
   async function stopActiveSession(sendDelete = true) {
     clearUpNext();
+    clearStallWatchdog();
+    state.stallRecoveries = 0;
+    state.hudHovered = false;
     if (state.progressTimer) { clearInterval(state.progressTimer); state.progressTimer = null; }
     if (state.statsTimer) { clearInterval(state.statsTimer); state.statsTimer = null; }
     if (state.hls) { state.hls.destroy(); state.hls = null; }
@@ -732,25 +839,188 @@
     return sid;
   }
 
-  function applySubtitleTrack(subIdx) {
+  function applyCueOffset(trackObj, deltaSecs) {
+    if (!trackObj || !trackObj.cues || !deltaSecs) return;
+    for (let i = 0; i < trackObj.cues.length; i++) {
+      const c = trackObj.cues[i];
+      c.startTime = Math.max(0, c.startTime + deltaSecs);
+      c.endTime = Math.max(c.startTime + 0.1, c.endTime + deltaSecs);
+    }
+  }
+
+  function applySubtitleOption(opt) {
     videoEl.querySelectorAll('track').forEach((t) => t.remove());
-    state.activeSubIdx = subIdx;
-    if (subIdx < 0 || subIdx >= state.subTracks.length || !state.currentMedia) {
+    state.activeSubOption = opt || null;
+    if (!opt || !state.currentMedia) {
+      state.activeSubIdx = -1;
       $('btn-sub').textContent = 'Sub: Off';
       return;
     }
-    const sub = state.subTracks[subIdx];
-    $('btn-sub').textContent = `Sub: ${(sub.language || 'ON').toUpperCase()}`;
+    $('btn-sub').textContent = `Sub: ${(opt.language || 'ON').toUpperCase().slice(0, 6)}`;
     const track = document.createElement('track');
     track.kind = 'subtitles';
-    track.label = sub.title || sub.language;
-    track.src = `/api/stream/${state.currentMedia.id}/subtitles/${sub.index}`;
+    track.label = opt.label || opt.language || 'Subtitles';
+    track.src = opt.url;
     track.default = true;
     track.addEventListener('load', () => {
-      if (videoEl.textTracks[0]) videoEl.textTracks[0].mode = 'showing';
+      const tt = videoEl.textTracks[0];
+      if (tt) {
+        tt.mode = 'showing';
+        if (state.subOffsetSecs !== 0) applyCueOffset(tt, state.subOffsetSecs);
+      }
     });
     videoEl.appendChild(track);
     if (videoEl.textTracks[0]) videoEl.textTracks[0].mode = 'showing';
+  }
+
+  function applySubtitleTrack(subIdx) {
+    state.activeSubIdx = subIdx;
+    if (subIdx < 0 || subIdx >= state.subTracks.length || !state.currentMedia) {
+      applySubtitleOption(null);
+      return;
+    }
+    const sub = state.subTracks[subIdx];
+    applySubtitleOption({
+      id: `emb_${sub.index}`,
+      label: sub.title || sub.language || 'Embedded',
+      language: sub.language || 'ON',
+      source: 'embedded',
+      url: `/api/stream/${state.currentMedia.id}/subtitles/${sub.index}`,
+    });
+  }
+
+  function setSubModalStatus(msg, kind = '') {
+    const el = $('sub-modal-status');
+    if (!el) return;
+    el.textContent = msg || '';
+    el.className = `dmodal-status${kind ? ' ' + kind : ''}`;
+  }
+
+  function closeSubtitleModal() {
+    $('sub-modal').classList.add('hidden');
+    pokePlayerUi();
+    $('btn-sub')?.focus();
+  }
+
+  async function openSubtitleModal() {
+    if (!state.currentMedia) return;
+    clearTimeout(hideUiTimer);
+    playerOverlay.classList.remove('idle-hide');
+    $('sub-offset-label').textContent = `${state.subOffsetSecs >= 0 ? '+' : ''}${state.subOffsetSecs.toFixed(1)}s`;
+    $('sub-modal').classList.remove('hidden');
+    setSubModalStatus('Loading available subtitle tracks...');
+    const listEl = $('sub-modal-list');
+    listEl.innerHTML = '';
+
+    try {
+      const data = await api(`/api/media/${state.currentMedia.id}/subtitles`);
+      const tracks = data.tracks || [];
+      setSubModalStatus(
+        tracks.length > 0
+          ? `${tracks.length} local track(s) available — select one or click Find Online Subtitles.`
+          : 'No local subtitles found — click Find Online Subtitles to search OpenSubtitles.'
+      );
+      renderLocalSubtitleList(tracks);
+      listEl.querySelector('button')?.focus() || $('btn-sub-search-online')?.focus();
+    } catch (e) {
+      setSubModalStatus(`Could not load subtitles: ${e.message}`, 'error');
+    }
+  }
+
+  function renderLocalSubtitleList(tracks) {
+    const listEl = $('sub-modal-list');
+    listEl.innerHTML = '';
+    const frag = document.createDocumentFragment();
+
+    const offRow = document.createElement('button');
+    offRow.className = `dmodal-result-row focusable${!state.activeSubOption ? ' queued' : ''}`;
+    offRow.innerHTML = `
+      <div style="min-width:0; flex:1;"><div class="dmodal-result-name">Subtitles Off</div></div>
+      <span class="pill">${!state.activeSubOption ? '✓ Active' : 'Disable'}</span>
+    `;
+    offRow.onclick = () => { applySubtitleOption(null); closeSubtitleModal(); };
+    frag.appendChild(offRow);
+
+    tracks.forEach((tr) => {
+      const isAct = state.activeSubOption && state.activeSubOption.id === tr.id;
+      const row = document.createElement('button');
+      row.className = `dmodal-result-row focusable${isAct ? ' queued' : ''}`;
+      const badge = tr.source === 'downloaded' ? 'Downloaded' : tr.source === 'sidecar' ? 'Sidecar File' : 'Embedded';
+      row.innerHTML = `
+        <div style="min-width:0; flex:1;">
+          <div class="dmodal-result-name">${escapeHtml(tr.label)}</div>
+          <div class="dmodal-result-meta"><span class="tag">${badge}</span></div>
+        </div>
+        <span class="pill">${isAct ? '✓ Active' : 'Select'}</span>
+      `;
+      row.onclick = () => { applySubtitleOption(tr); closeSubtitleModal(); };
+      frag.appendChild(row);
+    });
+    listEl.appendChild(frag);
+  }
+
+  async function searchSubtitlesOnline() {
+    if (!state.currentMedia) return;
+    setSubModalStatus('🔍 Searching OpenSubtitles for English subtitles...');
+    const listEl = $('sub-modal-list');
+    listEl.innerHTML = '';
+    try {
+      const data = await api(`/api/media/${state.currentMedia.id}/subtitles/search?lang=eng`);
+      const results = data.results || [];
+      if (results.length === 0) {
+        setSubModalStatus('No online English subtitles found for this title.', 'error');
+        return;
+      }
+      setSubModalStatus(`Found ${results.length} online subtitle(s) — highlight a row and press A / Click to download & enable.`, 'ok');
+      const frag = document.createDocumentFragment();
+      results.forEach((r) => {
+        const row = document.createElement('button');
+        row.className = 'dmodal-result-row focusable';
+        row.innerHTML = `
+          <div style="min-width:0; flex:1;">
+            <div class="dmodal-result-name">${escapeHtml(r.filename)}</div>
+            <div class="dmodal-result-meta">
+              <span class="tag">${escapeHtml(r.language)}</span>
+              <span class="tag">${escapeHtml(r.format.toUpperCase())}</span>
+              ${r.hearing_impaired ? '<span class="tag">SDH</span>' : ''}
+              <span class="tag" style="color:#34d399;">↓ ${r.downloads.toLocaleString()}</span>
+            </div>
+          </div>
+          <span class="pill">⬇ Use</span>
+        `;
+        row.onclick = async () => {
+          row.disabled = true;
+          row.querySelector('.pill').textContent = '⏳ Loading...';
+          setSubModalStatus(`Downloading & converting "${r.filename}"...`);
+          try {
+            const dl = await api(`/api/media/${state.currentMedia.id}/subtitles/download`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                sub_id: r.sub_id,
+                download_url: r.download_url,
+                filename: r.filename,
+                language: r.language,
+              }),
+            });
+            if (dl.track) {
+              applySubtitleOption(dl.track);
+              setSubModalStatus(`✓ Loaded "${r.filename}"!`, 'ok');
+              closeSubtitleModal();
+            }
+          } catch (e) {
+            setSubModalStatus(`Subtitle download failed: ${e.message}`, 'error');
+            row.disabled = false;
+            row.querySelector('.pill').textContent = '⬇ Retry';
+          }
+        };
+        frag.appendChild(row);
+      });
+      listEl.appendChild(frag);
+      listEl.querySelector('button')?.focus();
+    } catch (e) {
+      setSubModalStatus(`Online search failed: ${e.message}`, 'error');
+    }
   }
 
   async function computeNextEpisode(item) {
@@ -801,7 +1071,7 @@
     playerStats.textContent = startSecs > 15 ? `Resuming at ${fmtClock(startSecs)}...` : 'Starting stream in RAM...';
     showSpinner(startSecs > 15 ? `Resuming at ${fmtClock(startSecs)}...` : 'Starting stream...');
     pokePlayerUi();
-    setTimeout(() => seekBar.focus(), 60);
+    setTimeout(() => btnPlayPause.focus(), 60);
 
     try {
       const subs = JSON.parse(item.subtitles_json || '[]');
@@ -880,11 +1150,12 @@
   }
 
   // Video element lifecycle hooks
-  videoEl.addEventListener('waiting', () => showSpinner('Buffering...'));
+  videoEl.addEventListener('waiting', () => { showSpinner('Buffering...'); armStallWatchdog(); });
   videoEl.addEventListener('seeking', () => showSpinner('Seeking...'));
-  videoEl.addEventListener('playing', () => { hideSpinner(); btnPlayPause.textContent = '⏸ Pause'; pokePlayerUi(); });
+  videoEl.addEventListener('playing', () => { clearStallWatchdog(); state.stallRecoveries = 0; hideSpinner(); btnPlayPause.textContent = '⏸ Pause'; pokePlayerUi(); });
+  videoEl.addEventListener('timeupdate', () => { if (!videoEl.paused && videoEl.readyState >= 3) clearStallWatchdog(); });
   videoEl.addEventListener('canplay', () => hideSpinner());
-  videoEl.addEventListener('pause', () => { btnPlayPause.textContent = '▶ Play'; flushProgress(false); pokePlayerUi(); });
+  videoEl.addEventListener('pause', () => { clearStallWatchdog(); btnPlayPause.textContent = '▶ Play'; flushProgress(false); pokePlayerUi(); });
   videoEl.addEventListener('ended', () => {
     flushProgress(false);
     if (state.nextEpisode) {
@@ -943,11 +1214,23 @@
     playMedia(state.currentMedia, QUALITIES[state.qualityIdx].value, absCurrentTime(), false, true);
   };
   $('btn-sub').onclick = () => {
-    if (!state.subTracks.length) return;
-    const next = state.activeSubIdx + 1 >= state.subTracks.length ? -1 : state.activeSubIdx + 1;
-    applySubtitleTrack(next);
-    pokePlayerUi();
+    openSubtitleModal();
   };
+  $('btn-submodal-close').onclick = () => closeSubtitleModal();
+  $('btn-sub-search-online').onclick = () => searchSubtitlesOnline();
+  $('btn-sub-offset-minus').onclick = () => {
+    state.subOffsetSecs = Math.round((state.subOffsetSecs - 0.5) * 10) / 10;
+    $('sub-offset-label').textContent = `${state.subOffsetSecs >= 0 ? '+' : ''}${state.subOffsetSecs.toFixed(1)}s`;
+    if (videoEl.textTracks[0]) applyCueOffset(videoEl.textTracks[0], -0.5);
+  };
+  $('btn-sub-offset-plus').onclick = () => {
+    state.subOffsetSecs = Math.round((state.subOffsetSecs + 0.5) * 10) / 10;
+    $('sub-offset-label').textContent = `${state.subOffsetSecs >= 0 ? '+' : ''}${state.subOffsetSecs.toFixed(1)}s`;
+    if (videoEl.textTracks[0]) applyCueOffset(videoEl.textTracks[0], 0.5);
+  };
+  $('sub-modal')?.addEventListener('click', (e) => {
+    if (e.target === $('sub-modal')) closeSubtitleModal();
+  });
 
   // Seek bar mouse click + hover preview
   $('seek-wrap').onclick = (e) => {
@@ -983,6 +1266,23 @@
     else playerOverlay.requestFullscreen?.().catch(() => {});
   };
   playerOverlay.addEventListener('mousemove', pokePlayerUi);
+  playerOverlay.addEventListener('click', (e) => {
+    if (e.target === playerOverlay) {
+      btnPlayPause.focus();
+      btnPlayPause.click();
+    }
+  });
+  document.querySelectorAll('.player-top, .player-bottom').forEach((bar) => {
+    bar.addEventListener('mouseenter', () => {
+      state.hudHovered = true;
+      clearTimeout(hideUiTimer);
+      playerOverlay.classList.remove('idle-hide');
+    });
+    bar.addEventListener('mouseleave', () => {
+      state.hudHovered = false;
+      pokePlayerUi();
+    });
+  });
 
   // Diagnostics & Navigation handlers
   $('btn-diag').onclick = async () => {
@@ -1014,6 +1314,7 @@
     b.onclick = () => {
       if (b.dataset.tab === 'shows') renderShows();
       if (b.dataset.tab === 'movies') renderMovies();
+      if (b.dataset.tab === 'discover') loadDiscoverCatalog(false);
       switchTab(b.dataset.tab, true);
     };
   });
@@ -1066,9 +1367,14 @@
   // Unified Back stack (B button & Escape)
   function handleBack() {
     if (!playerOverlay.classList.contains('hidden')) {
+      if (!$('sub-modal').classList.contains('hidden')) { closeSubtitleModal(); return; }
       if (state.scrubTarget !== null) { cancelScrub(); return; }
       if (!$('upnext-banner').classList.contains('hidden')) { clearUpNext(); return; }
       $('btn-close-player').click();
+      return;
+    }
+    if (!$('discover-modal').classList.contains('hidden')) {
+      closeDiscoverModal();
       return;
     }
     if (!$('diag-panel').classList.contains('hidden')) {
@@ -1093,9 +1399,12 @@
   function visibleFocusables() {
     let scope = document;
     if (!playerOverlay.classList.contains('hidden')) {
-      if (!$('player-error-banner').classList.contains('hidden')) scope = $('player-error-banner');
+      if (!$('sub-modal').classList.contains('hidden')) scope = $('sub-modal');
+      else if (!$('player-error-banner').classList.contains('hidden')) scope = $('player-error-banner');
       else if (!$('upnext-banner').classList.contains('hidden')) scope = $('upnext-banner');
       else scope = playerOverlay;
+    } else if (!$('discover-modal').classList.contains('hidden')) {
+      scope = $('discover-modal');
     }
     return Array.from(scope.querySelectorAll('.focusable')).filter((el) => el.offsetParent !== null);
   }
@@ -1112,34 +1421,67 @@
     const cur = document.activeElement;
     if (!items.includes(cur)) { items[0].focus(); return; }
     const r = cur.getBoundingClientRect();
+    const rCx = r.left + r.width / 2;
+    const rCy = r.top + r.height / 2;
     let best = null;
     let bestScore = Infinity;
 
-    for (const el of items) {
-      if (el === cur) continue;
-      const er = el.getBoundingClientRect();
-      let primary = 0;
-      let secondary = 0;
-      if (dir === 'right') {
-        if (er.left + er.width / 2 <= r.left + r.width / 2 + 4) continue;
-        primary = Math.max(0, er.left - r.right) + (er.left - r.left) * 0.2;
-        secondary = intervalGap(r.top, r.bottom, er.top, er.bottom);
-      } else if (dir === 'left') {
-        if (er.left + er.width / 2 >= r.left + r.width / 2 - 4) continue;
-        primary = Math.max(0, r.left - er.right) + (r.left - er.left) * 0.2;
-        secondary = intervalGap(r.top, r.bottom, er.top, er.bottom);
-      } else if (dir === 'down') {
-        if (er.top + er.height / 2 <= r.top + r.height / 2 + 4) continue;
-        primary = Math.max(0, er.top - r.bottom) + (er.top - r.top) * 0.2;
-        secondary = intervalGap(r.left, r.right, er.left, er.right);
-      } else if (dir === 'up') {
-        if (er.top + er.height / 2 >= r.top + r.height / 2 - 4) continue;
-        primary = Math.max(0, r.top - er.bottom) + (r.top - er.top) * 0.2;
-        secondary = intervalGap(r.left, r.right, er.left, er.right);
+    if (dir === 'right' || dir === 'left') {
+      // Pass 1: Strict same-row navigation (stay on the current row until start/end)
+      for (const el of items) {
+        if (el === cur) continue;
+        const er = el.getBoundingClientRect();
+        if (intervalGap(r.top, r.bottom, er.top, er.bottom) > 8) continue;
+        const erCx = er.left + er.width / 2;
+        if (dir === 'right' && erCx <= rCx + 4) continue;
+        if (dir === 'left' && erCx >= rCx - 4) continue;
+        const primary = dir === 'right' ? Math.max(0, er.left - r.right) : Math.max(0, r.left - er.right);
+        const score = primary + Math.abs(erCx - rCx) * 0.1 + Math.abs((er.top + er.height / 2) - rCy) * 0.2;
+        if (score < bestScore) { bestScore = score; best = el; }
       }
-      const score = primary + secondary * 3.0;
-      if (score < bestScore) { bestScore = score; best = el; }
+
+      // Pass 2: At row start/end, wrap cleanly to the adjacent row
+      if (!best) {
+        const adj = items.filter((el) => {
+          if (el === cur) return false;
+          const er = el.getBoundingClientRect();
+          return dir === 'right' ? er.top >= r.bottom - 6 : er.bottom <= r.top + 6;
+        });
+        if (adj.length > 0) {
+          const minRowDist = Math.min(
+            ...adj.map((el) => {
+              const er = el.getBoundingClientRect();
+              return dir === 'right' ? Math.max(0, er.top - r.bottom) : Math.max(0, r.top - er.bottom);
+            })
+          );
+          const nextRow = adj.filter((el) => {
+            const er = el.getBoundingClientRect();
+            const d = dir === 'right' ? Math.max(0, er.top - r.bottom) : Math.max(0, r.top - er.bottom);
+            return d <= minRowDist + 24;
+          });
+          nextRow.sort((a, b) => {
+            const ar = a.getBoundingClientRect();
+            const br = b.getBoundingClientRect();
+            return dir === 'right' ? ar.left - br.left : br.right - ar.right;
+          });
+          best = nextRow[0] || null;
+        }
+      }
+    } else {
+      // Up / Down: strictly jump to another row, closest row vertically then closest horizontally
+      for (const el of items) {
+        if (el === cur) continue;
+        const er = el.getBoundingClientRect();
+        if (dir === 'down' && er.top < r.bottom - 6) continue;
+        if (dir === 'up' && er.bottom > r.top + 6) continue;
+        const primary = dir === 'down' ? Math.max(0, er.top - r.bottom) : Math.max(0, r.top - er.bottom);
+        const hGap = intervalGap(r.left, r.right, er.left, er.right);
+        const cxDiff = Math.abs((er.left + er.width / 2) - rCx);
+        const score = primary * 2.5 + hGap * 2.0 + cxDiff * 0.35;
+        if (score < bestScore) { bestScore = score; best = el; }
+      }
     }
+
     if (best) {
       best.focus();
       best.scrollIntoView({ block: 'nearest', behavior: 'auto' });
@@ -1151,15 +1493,39 @@
       if (e.key === 'Escape') { e.preventDefault(); handleBack(); }
       return;
     }
-    const inPlayer = !playerOverlay.classList.contains('hidden');
+    const inPlayer = !playerOverlay.classList.contains('hidden') && $('sub-modal').classList.contains('hidden');
     if (inPlayer) {
       const wasIdle = playerOverlay.classList.contains('idle-hide');
+      const looseFocus = !document.activeElement || document.activeElement === document.body || document.activeElement === videoEl || !playerOverlay.contains(document.activeElement);
       pokePlayerUi();
-      const onSeekBar = document.activeElement === seekBar || wasIdle;
+      if (e.key === 'MediaPlayPause' || e.key === ' ' || e.key === 'k' || e.key === 'K') {
+        e.preventDefault();
+        btnPlayPause.focus();
+        btnPlayPause.click();
+        return;
+      }
+      if (e.key === 'MediaPlay') { e.preventDefault(); videoEl.play().catch(() => {}); pokePlayerUi(); return; }
+      if (e.key === 'MediaPause') { e.preventDefault(); videoEl.pause(); pokePlayerUi(); return; }
+      if (e.key === 'MediaStop') { e.preventDefault(); $('btn-close-player').click(); return; }
+      if (e.key === 'Enter') {
+        if (state.scrubTarget !== null) { e.preventDefault(); commitScrub(); return; }
+        if (wasIdle || looseFocus || document.activeElement === seekBar) {
+          e.preventDefault();
+          btnPlayPause.focus();
+          btnPlayPause.click();
+          return;
+        }
+      }
+      if ((wasIdle || looseFocus) && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
+        e.preventDefault();
+        cancelScrub();
+        btnPlayPause.focus();
+        return;
+      }
+      const onSeekBar = document.activeElement === seekBar || wasIdle || looseFocus;
       if (e.key === 'ArrowRight' && onSeekBar) { e.preventDefault(); seekBar.focus(); stepScrub(1, false); return; }
       if (e.key === 'ArrowLeft' && onSeekBar) { e.preventDefault(); seekBar.focus(); stepScrub(-1, false); return; }
-      if (e.key === 'Enter' && state.scrubTarget !== null) { e.preventDefault(); commitScrub(); return; }
-      if (e.key === ' ' || e.key === 'k' || e.key === 'K') { e.preventDefault(); btnPlayPause.click(); return; }
+      if (e.key === 'ArrowDown' && document.activeElement === seekBar) { e.preventDefault(); cancelScrub(); btnPlayPause.focus(); return; }
       if (e.key === '0' || e.key === 'Home') { e.preventDefault(); $('btn-restart').click(); return; }
       if (e.key === 'j' || e.key === 'J') { e.preventDefault(); $('btn-rw').click(); return; }
       if (e.key === 'l' || e.key === 'L') { e.preventDefault(); $('btn-ff').click(); return; }
@@ -1195,13 +1561,14 @@
     const pressed = (i) => !!pad.buttons[i]?.pressed;
     const justPressed = (i) => pressed(i) && !state.prevPadButtons[i];
 
-    const inPlayer = !playerOverlay.classList.contains('hidden');
+    const inPlayer = !playerOverlay.classList.contains('hidden') && $('sub-modal').classList.contains('hidden');
     const axX = pad.axes[0] || 0;
     const axY = pad.axes[1] || 0;
-    const rightHeld = pressed(15) || axX > 0.55;
-    const leftHeld = pressed(14) || axX < -0.55;
-    const downHeld = pressed(13) || axY > 0.55;
-    const upHeld = pressed(12) || axY < -0.55;
+    const horizDominant = Math.abs(axX) >= Math.abs(axY);
+    const rightHeld = pressed(15) || (horizDominant && axX > 0.55);
+    const leftHeld = pressed(14) || (horizDominant && axX < -0.55);
+    const downHeld = pressed(13) || (!horizDominant && axY > 0.55);
+    const upHeld = pressed(12) || (!horizDominant && axY < -0.55);
 
     if (!leftHeld && !rightHeld) state.scrubHoldCount = 0;
 
@@ -1213,9 +1580,16 @@
       else if (justPressed(7)) { cancelScrub(); seekToAbs(absCurrentTime() + 60); pokePlayerUi(); }
       else if (justPressed(2)) { btnPlayPause.click(); }
       else if (justPressed(0)) {
+        const looseFocus = !document.activeElement || document.activeElement === document.body || document.activeElement === videoEl || !playerOverlay.contains(document.activeElement);
         if (state.scrubTarget !== null) commitScrub();
-        else if (playerOverlay.classList.contains('idle-hide') || document.activeElement === seekBar) btnPlayPause.click();
-        else document.activeElement?.click();
+        else if (playerOverlay.classList.contains('idle-hide') || looseFocus || document.activeElement === seekBar) {
+          pokePlayerUi();
+          btnPlayPause.focus();
+          btnPlayPause.click();
+        } else {
+          pokePlayerUi();
+          document.activeElement?.click();
+        }
       } else if (justPressed(1)) {
         handleBack();
       }
@@ -1228,9 +1602,17 @@
     if (now - state.lastGamepadNav > 150) {
       if (inPlayer) {
         const wasIdle = playerOverlay.classList.contains('idle-hide');
-        const onSeekBar = document.activeElement === seekBar || wasIdle;
-        if (rightHeld && onSeekBar) { seekBar.focus(); stepScrub(1, true); state.lastGamepadNav = now; }
-        else if (leftHeld && onSeekBar) { seekBar.focus(); stepScrub(-1, true); state.lastGamepadNav = now; }
+        const looseFocus = !document.activeElement || document.activeElement === document.body || document.activeElement === videoEl || !playerOverlay.contains(document.activeElement);
+        const onSeekBar = document.activeElement === seekBar || wasIdle || looseFocus;
+        if ((wasIdle || looseFocus) && (downHeld || upHeld)) {
+          cancelScrub();
+          pokePlayerUi();
+          btnPlayPause.focus();
+          state.lastGamepadNav = now;
+        }
+        else if (rightHeld && onSeekBar) { seekBar.focus(); stepScrub(1, true); state.lastGamepadNav = now; }
+        else if (leftHeld && onSeekBar) { seekBar.focus(); stepScrub(1 * -1, true); state.lastGamepadNav = now; }
+        else if (downHeld && document.activeElement === seekBar) { cancelScrub(); pokePlayerUi(); btnPlayPause.focus(); state.lastGamepadNav = now; }
         else if (rightHeld) { pokePlayerUi(); moveFocus('right'); state.lastGamepadNav = now; }
         else if (leftHeld) { pokePlayerUi(); moveFocus('left'); state.lastGamepadNav = now; }
         else if (downHeld) { cancelScrub(); pokePlayerUi(); moveFocus('down'); state.lastGamepadNav = now; }
@@ -1264,6 +1646,12 @@
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden) startGamepadLoop();
   });
+  // Xbox Edge fallback: gamepadconnected does not always fire until after input
+  setInterval(() => {
+    if (!state.gamepadRaf && !document.hidden && activeGamepad()) {
+      startGamepadLoop();
+    }
+  }, 1000);
 
   loadAll();
   startGamepadLoop();

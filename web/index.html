@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>NulKast MediaServer</title>
-  <link rel="stylesheet" href="/web/style.css?v=6" />
+  <link rel="stylesheet" href="/web/style.css?v=19" />
   <script src="/web/hls.min.js" defer></script>
 </head>
 <body>
@@ -18,6 +18,7 @@
       <button class="nav-btn focusable active" role="tab" aria-selected="true" data-tab="home">Home</button>
       <button class="nav-btn focusable" role="tab" aria-selected="false" data-tab="movies">Movies</button>
       <button class="nav-btn focusable" role="tab" aria-selected="false" data-tab="shows">TV Shows</button>
+      <button class="nav-btn focusable hidden" id="nav-discover" role="tab" aria-selected="false" data-tab="discover">Discover</button>
       <button class="nav-btn focusable" id="btn-scan" title="Rescan Library">↻ Scan</button>
       <button class="nav-btn focusable" id="btn-diag" title="Toggle Diagnostics">Diag: ON</button>
     </nav>
@@ -88,11 +89,62 @@
       <div id="episodes-list" class="episode-list hidden"></div>
     </section>
 
+    <section id="view-discover" class="view">
+      <div class="movies-toolbar">
+        <div class="section-head" style="justify-content:space-between; width:100%; flex-wrap:wrap; gap:10px;">
+          <h2 id="discover-heading">Discover New Releases</h2>
+          <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+            <input id="discover-search-input" class="search-box focusable" type="search" placeholder="Filter movies or Lookup any TV show..." aria-label="Filter or lookup Discover catalog" style="width:240px;" />
+            <button id="btn-discover-lookup" class="pill-btn focusable hidden">🔍 Lookup Any Show</button>
+            <button id="btn-discover-refresh" class="pill-btn focusable">↻ Refresh Catalog</button>
+          </div>
+        </div>
+        <div class="chip-row" role="group" aria-label="Discover Sections">
+          <span class="chip-label">View:</span>
+          <button class="chip focusable active" data-discover-mode="movies">Movies</button>
+          <button class="chip focusable" data-discover-mode="tv">TV Shows</button>
+          <button class="chip focusable" data-discover-mode="transfers" id="chip-discover-transfers">Downloads</button>
+          <span class="chip-label" style="margin-left:10px;">Sort:</span>
+          <button class="chip focusable active" data-discover-sort="popular">Popular</button>
+          <button class="chip focusable" data-discover-sort="newest">Newest</button>
+          <button class="chip focusable" data-discover-sort="title">A-Z</button>
+        </div>
+        <div id="discover-filter-chips" class="chip-row" role="group" aria-label="Filter Discover Catalog"></div>
+        <div id="discover-genre-chips" class="chip-row hidden" role="group" aria-label="Filter Discover TV Genres"></div>
+      </div>
+      <div id="discover-status" class="discover-status hidden"></div>
+      <div id="discover-grid" class="card-grid"></div>
+      <div id="discover-transfers" class="episode-list hidden"></div>
+    </section>
+
     <section id="view-search" class="view">
       <h2 id="search-heading">Search Results</h2>
       <div id="search-grid" class="card-grid"></div>
     </section>
   </main>
+
+  <!-- Discover / Send-to-Torrent Modal -->
+  <div id="discover-modal" class="discover-modal hidden" role="dialog" aria-modal="true" aria-label="Download to Torrent Client">
+    <div class="discover-modal-card">
+      <div class="discover-modal-head">
+        <img id="dmodal-poster" class="dmodal-poster" alt="" />
+        <div class="dmodal-info">
+          <div class="dmodal-title-row">
+            <h3 id="dmodal-title" class="dmodal-title"></h3>
+            <button id="btn-dmodal-close" class="pill-btn focusable">✕ Close</button>
+          </div>
+          <div id="dmodal-meta" class="dmodal-meta"></div>
+          <p id="dmodal-summary" class="dmodal-summary"></p>
+          <div id="dmodal-seasons" class="chip-row hidden"></div>
+          <div id="dmodal-plan-opts" class="chip-row hidden"></div>
+          <div id="dmodal-actions" class="modal-actions"></div>
+        </div>
+      </div>
+      <div id="dmodal-status" class="dmodal-status"></div>
+      <div id="dmodal-fallbacks" class="chip-row hidden" style="margin-bottom:10px;"></div>
+      <div id="dmodal-results" class="dmodal-results"></div>
+    </div>
+  </div>
 
   <!-- Fullscreen Video Player Overlay -->
   <div id="player-overlay" class="player-overlay hidden" role="dialog" aria-modal="true" aria-label="Video Player">
@@ -103,6 +155,7 @@
         <div id="player-stats" class="player-stats"></div>
       </div>
       <div class="player-controls-top">
+        <button id="btn-restart" class="pill-btn focusable" title="Restart from beginning">⏮ Restart</button>
         <button id="btn-quality" class="pill-btn focusable" title="Cycle playback quality">Quality: Auto</button>
         <button id="btn-sub" class="pill-btn focusable" title="Cycle subtitles">Sub: Off</button>
       </div>
@@ -140,6 +193,25 @@
       </div>
     </div>
 
+    <!-- In-Player Subtitle Picker & Online Finder Modal -->
+    <div id="sub-modal" class="discover-modal hidden" role="dialog" aria-modal="true" aria-label="Subtitles">
+      <div class="discover-modal-card" style="max-width:740px;">
+        <div class="dmodal-title-row" style="margin-bottom:10px;">
+          <h3 class="dmodal-title" style="margin:0;">Subtitles</h3>
+          <button id="btn-submodal-close" class="pill-btn focusable">✕ Close</button>
+        </div>
+        <div class="chip-row" style="margin-bottom:12px;">
+          <span class="chip-label">Timing Offset:</span>
+          <button id="btn-sub-offset-minus" class="chip focusable">−0.5s</button>
+          <span id="sub-offset-label" class="pill">0.0s</span>
+          <button id="btn-sub-offset-plus" class="chip focusable">+0.5s</button>
+          <button id="btn-sub-search-online" class="pill-btn active-btn focusable" style="margin-left:auto;">🔍 Find Online Subtitles</button>
+        </div>
+        <div id="sub-modal-status" class="dmodal-status"></div>
+        <div id="sub-modal-list" class="dmodal-results"></div>
+      </div>
+    </div>
+
     <div id="player-bottom" class="player-bottom">
       <div id="seek-wrap" class="seek-wrap">
         <div id="seek-bar" class="seek-bar focusable" tabindex="0" role="slider" aria-label="Seek timeline" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
@@ -152,7 +224,6 @@
       <div class="player-controls-bottom">
         <div class="player-btn-group">
           <button id="btn-play-pause" class="pill-btn focusable">⏸ Pause</button>
-          <button id="btn-restart" class="pill-btn focusable" title="Restart from beginning">⏮ Restart</button>
           <button id="btn-rw" class="pill-btn focusable">↺ -10s</button>
           <button id="btn-ff" class="pill-btn focusable">↻ +30s</button>
           <button id="btn-next-ep" class="pill-btn focusable hidden">⏭ Next Ep</button>
@@ -168,6 +239,7 @@
     </div>
   </div>
 
-  <script src="/web/app.js?v=6" defer></script>
+  <script src="/api/discover/ui.js" defer></script>
+  <script src="/web/app.js?v=18" defer></script>
 </body>
 </html>

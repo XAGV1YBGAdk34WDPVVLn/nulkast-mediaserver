@@ -19,9 +19,11 @@ pub struct AppConfig {
     pub hls_segment_secs: u32,
     pub idle_timeout_secs: u64,
     pub scan_on_startup: bool,
+    pub scan_interval_secs: u64,
     pub diagnostics_enabled: bool,
     pub online_artwork: bool,
     pub tmdb_api_key: Option<String>,
+    pub torrent_api_url: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -41,9 +43,11 @@ impl Default for AppConfig {
             hls_segment_secs: 4,
             idle_timeout_secs: 900,
             scan_on_startup: true,
+            scan_interval_secs: 900,
             diagnostics_enabled: true,
             online_artwork: true,
             tmdb_api_key: None,
+            torrent_api_url: None,
         }
     }
 }
@@ -102,6 +106,9 @@ impl AppConfig {
         if let Ok(v) = std::env::var("SCAN_ON_STARTUP") {
             cfg.scan_on_startup = !matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "no");
         }
+        if let Ok(v) = std::env::var("SCAN_INTERVAL_SECS") {
+            if let Ok(n) = v.parse() { cfg.scan_interval_secs = n; }
+        }
         if let Ok(v) = std::env::var("DIAGNOSTICS_ENABLED") {
             cfg.diagnostics_enabled = !matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "no");
         }
@@ -110,6 +117,10 @@ impl AppConfig {
         }
         if let Ok(v) = std::env::var("TMDB_API_KEY") {
             if !v.trim().is_empty() { cfg.tmdb_api_key = Some(v); }
+        }
+        if let Ok(v) = std::env::var("TORRENT_API_URL") {
+            let trimmed = v.trim().trim_end_matches('/').to_string();
+            if !trimmed.is_empty() { cfg.torrent_api_url = Some(trimmed); }
         }
 
         cfg
