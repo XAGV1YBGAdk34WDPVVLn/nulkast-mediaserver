@@ -157,7 +157,6 @@
       <div class="player-controls-top">
         <button id="btn-restart" class="pill-btn focusable" title="Restart from beginning">⏮ Restart</button>
         <button id="btn-quality" class="pill-btn focusable" title="Cycle playback quality">Quality: Auto</button>
-        <button id="btn-sub" class="pill-btn focusable" title="Cycle subtitles">Sub: Off</button>
       </div>
     </div>
 
@@ -226,11 +225,12 @@
           <button id="btn-play-pause" class="pill-btn focusable">⏸ Pause</button>
           <button id="btn-rw" class="pill-btn focusable">↺ -10s</button>
           <button id="btn-ff" class="pill-btn focusable">↻ +30s</button>
+          <button id="btn-sub" class="pill-btn focusable" title="Subtitles & Online Finder">💬 Sub: Off</button>
           <button id="btn-next-ep" class="pill-btn focusable hidden">⏭ Next Ep</button>
           <span id="player-time" class="player-time">0:00 / 0:00</span>
         </div>
         <div class="player-btn-group">
-          <span class="xbox-hints">LB/RB ±10/30s • LT/RT ±60s • Stick + A Jump • X Play/Pause • B Back</span>
+          <span class="xbox-hints">Y/Down Menu • A Pause • LB/RB ±10/30s • B Back</span>
           <button id="btn-mute" class="pill-btn focusable" aria-label="Toggle mute">🔊</button>
           <input id="vol-slider" class="vol-slider focusable" type="range" aria-label="Volume" min="0" max="1" step="0.05" value="1" />
           <button id="btn-fullscreen" class="pill-btn focusable">⛶ Fullscreen</button>
@@ -240,6 +240,6 @@
   </div>
 
   <script src="/api/discover/ui.js" defer></script>
-  <script src="/web/app.js?v=20" defer></script>
+  <script src="/web/app.js?v=21" defer></script>
 </body>
 </html>

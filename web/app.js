@@ -862,10 +862,10 @@
     state.activeSubOption = opt || null;
     if (!opt || !state.currentMedia) {
       state.activeSubIdx = -1;
-      $('btn-sub').textContent = 'Sub: Off';
+      $('btn-sub').textContent = '💬 Sub: Off';
       return;
     }
-    $('btn-sub').textContent = `Sub: ${(opt.language || 'ON').toUpperCase().slice(0, 6)}`;
+    $('btn-sub').textContent = `💬 Sub: ${(opt.language || 'ON').toUpperCase().slice(0, 6)}`;
     const track = document.createElement('track');
     track.kind = 'subtitles';
     track.label = opt.label || opt.language || 'Subtitles';
@@ -1091,7 +1091,8 @@
     } catch {
       state.subTracks = [];
     }
-    $('btn-sub').classList.toggle('hidden', state.subTracks.length === 0);
+    // Always keep Subtitles button visible so Online Subtitle Finder works even with 0 embedded tracks
+    $('btn-sub').classList.remove('hidden');
     applySubtitleTrack(savedSubIdx);
 
     computeNextEpisode(item);
@@ -1545,27 +1546,29 @@
       }
       if ((wasIdle || looseFocus) && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
         e.preventDefault();
+        e.stopPropagation();
         cancelScrub();
         btnPlayPause.focus();
         return;
       }
       const onSeekBar = document.activeElement === seekBar || wasIdle || looseFocus;
-      if (e.key === 'ArrowRight' && onSeekBar) { e.preventDefault(); seekBar.focus(); stepScrub(1, false); return; }
-      if (e.key === 'ArrowLeft' && onSeekBar) { e.preventDefault(); seekBar.focus(); stepScrub(-1, false); return; }
-      if (e.key === 'ArrowDown' && document.activeElement === seekBar) { e.preventDefault(); cancelScrub(); btnPlayPause.focus(); return; }
+      if (e.key === 'ArrowRight' && onSeekBar) { e.preventDefault(); e.stopPropagation(); seekBar.focus(); stepScrub(1, false); return; }
+      if (e.key === 'ArrowLeft' && onSeekBar) { e.preventDefault(); e.stopPropagation(); seekBar.focus(); stepScrub(-1, false); return; }
+      if (e.key === 'ArrowDown' && document.activeElement === seekBar) { e.preventDefault(); e.stopPropagation(); cancelScrub(); btnPlayPause.focus(); return; }
       if (e.key === '0' || e.key === 'Home') { e.preventDefault(); $('btn-restart').click(); return; }
       if (e.key === 'j' || e.key === 'J') { e.preventDefault(); $('btn-rw').click(); return; }
       if (e.key === 'l' || e.key === 'L') { e.preventDefault(); $('btn-ff').click(); return; }
+      if (e.key === 'c' || e.key === 'C') { e.preventDefault(); openSubtitleModal(); return; }
       if (e.key === 'm' || e.key === 'M') { e.preventDefault(); $('btn-mute').click(); return; }
       if (e.key === 'f' || e.key === 'F') { e.preventDefault(); $('btn-fullscreen').click(); return; }
       if (e.key === 'ArrowUp' || e.key === 'ArrowDown') cancelScrub();
     }
-    if (e.key === 'Escape' || e.key === 'Backspace') { e.preventDefault(); handleBack(); return; }
-    if (e.key === 'ArrowRight') { e.preventDefault(); moveFocus('right'); }
-    else if (e.key === 'ArrowLeft') { e.preventDefault(); moveFocus('left'); }
-    else if (e.key === 'ArrowDown') { e.preventDefault(); moveFocus('down'); }
-    else if (e.key === 'ArrowUp') { e.preventDefault(); moveFocus('up'); }
-  });
+    if (e.key === 'Escape' || e.key === 'Backspace') { e.preventDefault(); e.stopPropagation(); handleBack(); return; }
+    if (e.key === 'ArrowRight') { e.preventDefault(); e.stopPropagation(); moveFocus('right'); }
+    else if (e.key === 'ArrowLeft') { e.preventDefault(); e.stopPropagation(); moveFocus('left'); }
+    else if (e.key === 'ArrowDown') { e.preventDefault(); e.stopPropagation(); moveFocus('down'); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); e.stopPropagation(); moveFocus('up'); }
+  }, { capture: true });
 
   window.addEventListener('keyup', (e) => {
     if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
@@ -1606,6 +1609,12 @@
       else if (justPressed(6)) { cancelScrub(); seekToAbs(absCurrentTime() - 60); pokePlayerUi(); }
       else if (justPressed(7)) { cancelScrub(); seekToAbs(absCurrentTime() + 60); pokePlayerUi(); }
       else if (justPressed(2)) { btnPlayPause.click(); }
+      else if (justPressed(3) || justPressed(8) || justPressed(9)) {
+        // Y / View / Menu button: reliably wake bottom HUD & focus Play/Pause without pausing
+        cancelScrub();
+        pokePlayerUi();
+        btnPlayPause.focus();
+      }
       else if (justPressed(0)) {
         const looseFocus = !document.activeElement || document.activeElement === document.body || document.activeElement === videoEl || !playerOverlay.contains(document.activeElement);
         if (state.scrubTarget !== null) commitScrub();
